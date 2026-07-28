@@ -111,35 +111,27 @@ class CrazyBridge(Node):
         self._last_seen_marker: float = 0
         self._safe_to_fly_lock = threading.Lock()
 
-        self._odom_pub = self.create_publisher(Odometry, '~/odometry', 1)
-        self._batt_pub = self.create_publisher(Float32, '~/battery', 1)
-        self._thrust_pub = self.create_publisher(Float32, 'thrust', 1)
-        self.torque_pub = self.create_publisher(Vector3, 'torque', 1)
-        self._trans_error_pub = self.create_publisher(Vector3, 'pos_error', 1)
-        # Controller setpoint (ctrltarget.*): the planned/reference position the
-        # high-level commander feeds the controller. Config-independent (a core
-        # firmware log group), so it is the trajectory to overlay against the
-        # measured path in the controller-comparison test.
-        self._setpoint_pub = self.create_publisher(PointStamped, 'setpoint', 1)
-        self._qd_pub = self.create_publisher(
-            Quaternion, 'orientation/desired', 1)
-        self._qe_pub = self.create_publisher(
-            Quaternion, 'orientation/error', 1)
+        # Telemetry publishers (names/types live in interface.BridgePublishers,
+        # shared with the client nodes so they cannot drift). ~/odometry and
+        # ~/setpoint carry the actual and planned paths; thrust/torque/pos_error
+        # carry the OOT control signals and tracking error.
+        self._pubs = BridgePublishers(self)
+
         self._marker_sub = self.create_subscription(
-            PointStamped, 'optitrack/marker', self._marker_cb,
+            PointStamped, Create.MARKER, self._marker_cb,
             QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         )
 
         self._takeoff_srv = self.create_service(
-            Takeoff, '~/takeoff', self._takeoff_cb)
+            Takeoff, Create.SRV_TAKEOFF, self._takeoff_cb)
         self._land_srv = self.create_service(
-            Land, '~/land', self._land_cb)
+            Land, Create.SRV_LAND, self._land_cb)
         self._goto_srv = self.create_service(
-            GoTo, '~/go_to', self._goto_cb)
+            GoTo, Create.SRV_GOTO, self._goto_cb)
         self._spiral_srv = self.create_service(
-            Spiral, '~/spiral', self._spiral_cb)
+            Spiral, Create.SRV_SPIRAL, self._spiral_cb)
         self._kill_srv = self.create_service(
-            SetBool, '~/kill', self._kill_cb)
+            SetBool, Create.SRV_KILL, self._kill_cb)
 
         cflib.crtp.init_drivers()
         self._connected = threading.Event()
@@ -232,8 +224,8 @@ class CrazyBridge(Node):
         self._q_log.add_variable('kalman.q3', 'float')
 
         extra_period = self._sanitise_log_period(500, "extra_log_ms")
-        self._pm_log = LogConfig(name="battery", period_in_ms=extra_period)
-        self._pm_log.add_variable("pm.batteryLevel", "uint8_t")
+#        self._pm_log = LogConfig(name="battery", period_in_ms=extra_period)
+#        self._pm_log.add_variable("pm.batteryLevel", "uint8_t")
 
         # ctrltarget.* is the controller's desired position (the planned
         # trajectory the high-level commander is driving toward). It is a core
@@ -249,16 +241,16 @@ class CrazyBridge(Node):
         try:
             self._cf.log.add_config(self._pos_log)
             self._cf.log.add_config(self._q_log)
-            self._cf.log.add_config(self._pm_log)
+#            self._cf.log.add_config(self._pm_log)
             self._cf.log.add_config(self._setpoint_log)
             self._pos_log.data_received_cb.add_callback(self._on_pos_log)
             self._q_log.data_received_cb.add_callback(self._on_q_log)
-            self._pm_log.data_received_cb.add_callback(self._on_pm_log)
+#            self._pm_log.data_received_cb.add_callback(self._on_pm_log)
             self._setpoint_log.data_received_cb.add_callback(
                 self._on_setpoint_log)
             self._pos_log.start()
             self._q_log.start()
-            self._pm_log.start()
+#            self._pm_log.start()
             self._setpoint_log.start()
         except Exception as exc:
             self.get_logger().error(f'Failed to register log blocks: {exc}')
@@ -328,7 +320,7 @@ class CrazyBridge(Node):
     def _on_pm_log(self, _timestamp, data, _logconf):
         batt_msg = Float32()
         batt_msg.data = float(data["pm.batteryLevel"])
-        self._batt_pub.publish(batt_msg)
+        self._pubs.battery.publish(batt_msg)
 
     def _on_setpoint_log(self, _timestamp, data, _logconf):
         msg = PointStamped()
@@ -337,18 +329,18 @@ class CrazyBridge(Node):
         msg.point.x = float(data['ctrltarget.x'])
         msg.point.y = float(data['ctrltarget.y'])
         msg.point.z = float(data['ctrltarget.z'])
-        self._setpoint_pub.publish(msg)
+        self._pubs.setpoint.publish(msg)
 
     def _on_input_log(self, _timestamp, data, _logconf):
         thrust_msg = Float32()
         thrust_msg.data = float(data["oot.thrust"])
-        self._thrust_pub.publish(thrust_msg)
+        self._pubs.thrust.publish(thrust_msg)
 
         torque_msg = Vector3()
         torque_msg.x = float(data["oot.torque_x"])
         torque_msg.y = float(data["oot.torque_y"])
         torque_msg.z = float(data["oot.torque_z"])
-        self.torque_pub.publish(torque_msg)
+        self._pubs.torque.publish(torque_msg)
 
     def _apply_pid_conf(self, path: str) -> None:
         if not os.path.isfile(path):
@@ -508,7 +500,7 @@ class CrazyBridge(Node):
         msg.x = v[0]
         msg.y = v[1]
         msg.z = v[2]
-        self._trans_error_pub.publish(msg)
+        self._pubs.pos_error.publish(msg)
 
     def _on_q_err_log(self, _timestamp, data, _logconf) -> None:
         v = self._normalize_quat(
@@ -524,7 +516,7 @@ class CrazyBridge(Node):
         msg.y = v[1]
         msg.z = v[2]
         msg.w = v[3]
-        self._qe_pub.publish(msg)
+        self._pubs.orientation_error.publish(msg)
 
     def _on_qd_log(self, _timestamp, data, _logconf) -> None:
         v = self._normalize_quat(
@@ -540,7 +532,7 @@ class CrazyBridge(Node):
         msg.y = v[1]
         msg.z = v[2]
         msg.w = v[3]
-        self._qd_pub.publish(msg)
+        self._pubs.orientation_desired.publish(msg)
 
     def _on_ang_vel_err_log(self, _timestamp, data, _logconf) -> None:
         v = (
@@ -564,7 +556,7 @@ class CrazyBridge(Node):
         msg.pose.pose.orientation.y = quat[1]
         msg.pose.pose.orientation.z = quat[2]
         msg.pose.pose.orientation.w = quat[3]
-        self._odom_pub.publish(msg)
+        self._pubs.odom.publish(msg)
 
     @staticmethod
     def _normalize_quat(x: float, y: float, z: float, w: float) -> tuple[float, float, float, float]:

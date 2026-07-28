@@ -5,7 +5,7 @@ from rclpy.node import Node
 from std_msgs.msg import Float32
 from nav_msgs.msg import Odometry
 from scipy.spatial.transform import Rotation
-from geometry_msgs.msg import Vector3, Quaternion, PoseWithCovariance, Pose, Point
+from geometry_msgs.msg import Vector3, Quaternion, PoseWithCovariance, Pose, Point, PointStamped
 
 class Rerun(Node):
     def __init__(self):
@@ -19,6 +19,16 @@ class Rerun(Node):
         self.declare_parameter('rerun_app_id', 'crazybridge')
         self.declare_parameter('rerun_addr', '')
         self.declare_parameter('rerun_save_path', '')
+        # Cap on how many points to keep in each trajectory line strip so a long
+        # session does not grow the log unbounded.
+        self.declare_parameter('path_max_points', 5000)
+
+        self._path_max = int(
+            self.get_parameter('path_max_points').get_parameter_value().integer_value)
+        # Accumulated planned (setpoint) and actual (odometry) paths, drawn as
+        # 3D line strips so the tracking can be seen live and side by side.
+        self._planned_path: list[list[float]] = []
+        self._actual_path: list[list[float]] = []
 
         self._init_rerun()
         self._init_error_logs()
@@ -30,6 +40,7 @@ class Rerun(Node):
         self.create_subscription(Quaternion, 'orientation/desired', self._qd_cb, 1)
         self.create_subscription(Quaternion, 'orientation/error', self._qe_cb, 1)
         self.create_subscription(Odometry, '/crazybridge/odometry', self._odometry_cb, 1)
+        self.create_subscription(PointStamped, 'setpoint', self._setpoint_cb, 1)
 
     @staticmethod
     def _normalize_quat(q: Quaternion) -> tuple[float, float, float, float]:
@@ -94,10 +105,29 @@ class Rerun(Node):
         arrow_length = 0.2
         vector = rot.apply([1.0, 0.0, 0.0]) * arrow_length
         rr.log("drone", rr.Arrows3D(origins=[start], vectors=[vector], radii=[0.01]))
+        self._append_path(self._actual_path, start,
+                          "world/actual_path", [255, 140, 0])
         rr.log("/orientation/w", rr.Scalars(w))
         rr.log("/orientation/x", rr.Scalars(x))
         rr.log("/orientation/y", rr.Scalars(y))
         rr.log("/orientation/z", rr.Scalars(z))
+
+    def _setpoint_cb(self, msg: PointStamped):
+        p: Point = msg.point
+        self._append_path(self._planned_path, [p.x, p.y, p.z],
+                          "world/planned_path", [0, 180, 255])
+
+    def _append_path(self, buf: list, point: list, entity: str, color: list):
+        """Append a point to a path buffer and redraw it as a 3D line strip.
+
+        The planned (setpoint) and actual (odometry) paths are drawn as two
+        line strips so the tracking error is visible live and side by side.
+        """
+        buf.append([float(point[0]), float(point[1]), float(point[2])])
+        if len(buf) > self._path_max:
+            del buf[0]
+        if len(buf) >= 2:
+            rr.log(entity, rr.LineStrips3D([buf], colors=[color], radii=[0.004]))
 
     def _init_orientation_logs(self):
         rr.log(

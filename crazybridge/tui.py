@@ -25,16 +25,11 @@ from collections import deque
 from queue import Empty, Queue
 
 import rclpy
-from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 
-from builtin_interfaces.msg import Duration
-from geometry_msgs.msg import Point
-from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32
-from std_srvs.srv import SetBool
 
-from crazybridge_interfaces.srv import GoTo, Land, Spiral, Takeoff
+from crazybridge.interface import BridgeClientNode, Topics
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -43,25 +38,14 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Input, Label, Static
 
 
-def _seconds_to_duration(seconds: float) -> Duration:
-    d = Duration()
-    d.sec = int(seconds)
-    d.nanosec = int((seconds - int(seconds)) * 1e9)
-    return d
-
-
-class BridgeClient(Node):
+class BridgeClient(BridgeClientNode):
     def __init__(self) -> None:
+        # Base declares the service-name + odom_topic params, builds the service
+        # clients (self.takeoff_cli, ...), subscribes to odometry and gives us
+        # _sp/_dp + latest_odom().
         super().__init__('crazybridge_tui')
 
-        self.declare_parameter('odom_topic', '/crazybridge/odometry')
-        self.declare_parameter('battery_topic', '/crazybridge/battery')
-        self.declare_parameter('takeoff_srv', '/crazybridge/takeoff')
-        self.declare_parameter('land_srv', '/crazybridge/land')
-        self.declare_parameter('goto_srv', '/crazybridge/go_to')
-        self.declare_parameter('spiral_srv', '/crazybridge/spiral')
-        self.declare_parameter('kill_srv', '/crazybridge/kill')
-        self.declare_parameter('test_srv', '/crazybridge/test')
+        self.declare_parameter('battery_topic', Topics.BATTERY)
 
         self.declare_parameter('takeoff_height_m', 1.0)
         self.declare_parameter('takeoff_duration_s', 2.0)
@@ -71,46 +55,20 @@ class BridgeClient(Node):
         self.declare_parameter('nudge_step_m', 0.2)
         self.declare_parameter('nudge_yaw_deg', 15.0)
 
-        odom_topic = self._sp('odom_topic')
-        self.create_subscription(Odometry, odom_topic, self._odom_cb, 10)
-        batt_topic = self._sp('battery_topic')
-        self.create_subscription(Float32, batt_topic, self._batt_cb, 10)
+        self.create_subscription(
+            Float32, self._sp('battery_topic'), self._batt_cb, 10)
 
-        self._takeoff_cli = self.create_client(Takeoff, self._sp('takeoff_srv'))
-        self._kill_cli = self.create_client(SetBool, self._sp('kill_srv'))
-        self._test_cli = self.create_client(SetBool, self._sp('test_srv'))
-        self._land_cli = self.create_client(Land, self._sp('land_srv'))
-        self._goto_cli = self.create_client(GoTo, self._sp('goto_srv'))
-        self._spiral_cli = self.create_client(Spiral, self._sp('spiral_srv'))
-
-        self._state_lock = threading.Lock()
-        self._latest_odom: Odometry | None = None
+        self._batt_lock = threading.Lock()
         self._latest_batt: float | None = None
         self.events: Queue[str] = Queue()
 
-    def _sp(self, name: str) -> str:
-        return self.get_parameter(name).get_parameter_value().string_value
-
-    def _dp(self, name: str) -> float:
-        return self.get_parameter(name).get_parameter_value().double_value
-
-    def _odom_cb(self, msg: Odometry) -> None:
-        with self._state_lock:
-            self._latest_odom = msg
-
-    def snapshot(self) -> Odometry | None:
-        with self._state_lock:
-            return (self._latest_odom, self._latest_batt)
+    def snapshot(self) -> tuple:
+        with self._batt_lock:
+            batt = self._latest_batt
+        return (self.latest_odom(), batt)
 
     def service_status(self) -> dict[str, bool]:
-        return {
-            'takeoff': self._takeoff_cli.service_is_ready(),
-            'land': self._land_cli.service_is_ready(),
-            'go_to': self._goto_cli.service_is_ready(),
-            'spiral': self._spiral_cli.service_is_ready(),
-            'kill': self._kill_cli.service_is_ready(),
-            'test': self._test_cli.service_is_ready(),
-        }
+        return self.service_ready()
 
     def _on_response(self, label: str, future) -> None:
         try:
@@ -123,92 +81,49 @@ class BridgeClient(Node):
             self.events.put(f'{label} -> exception: {exc}')
 
     def _batt_cb(self, msg: Float32):
-        with self._state_lock:
+        with self._batt_lock:
             self._latest_batt = msg.data
 
-    def call_takeoff(self) -> None:
-        if not self._takeoff_cli.service_is_ready():
-            self.events.put('takeoff: service not available')
+    def _dispatch(self, client, req, label: str, unavailable: str) -> None:
+        """Fire a service call asynchronously, reporting via the event queue."""
+        if not client.service_is_ready():
+            self.events.put(unavailable)
             return
-        req = Takeoff.Request()
-        req.height = float(self._dp('takeoff_height_m'))
-        req.duration = _seconds_to_duration(self._dp('takeoff_duration_s'))
-        req.group_mask = 0
-        fut = self._takeoff_cli.call_async(req)
-        fut.add_done_callback(
-            lambda f: self._on_response(f'takeoff h={req.height:.2f}', f)
-        )
+        fut = client.call_async(req)
+        fut.add_done_callback(lambda f: self._on_response(label, f))
+
+    def call_takeoff(self) -> None:
+        h = float(self._dp('takeoff_height_m'))
+        req = self.takeoff_request(h, self._dp('takeoff_duration_s'))
+        self._dispatch(self.takeoff_cli, req, f'takeoff h={h:.2f}',
+                       'takeoff: service not available')
 
     def call_kill(self) -> None:
-        if not self._kill_cli.service_is_ready():
-            self.events.put('kill: service not available')
-            return
-        req = SetBool.Request()
-        req.data = True
-        fut = self._kill_cli.call_async(req)
-        fut.add_done_callback(
-            lambda f: self._on_response(f'Killed! {f.message}')
-        )
-
-    def call_test(self) -> None:
-        if not self._test_cli.service_is_ready():
-            self.events.put('Test: service not available')
-            return
-        req = SetBool.Request()
-        req.data = True
-        fut = self._test_cli.call_async(req)
-        fut.add_done_callback(
-            lambda f: self._on_response(f'Testing! {f.message}')
-        )
+        self._dispatch(self.kill_cli, self.bool_request(True), 'Killed!',
+                       'kill: service not available')
 
     def call_land(self) -> None:
-        if not self._land_cli.service_is_ready():
-            self.events.put('land: service not available')
-            return
-        req = Land.Request()
-        req.height = 0.0
-        req.duration = _seconds_to_duration(self._dp('land_duration_s'))
-        req.group_mask = 0
-        fut = self._land_cli.call_async(req)
-        fut.add_done_callback(lambda f: self._on_response('land', f))
+        req = self.land_request(0.0, self._dp('land_duration_s'))
+        self._dispatch(self.land_cli, req, 'land',
+                       'land: service not available')
 
     def call_nudge(self, dx: float, dy: float, dz: float, dyaw_deg: float = 0.0) -> None:
-        if not self._goto_cli.service_is_ready():
-            self.events.put('go_to: service not available')
-            return
-        req = GoTo.Request()
-        req.relative = True
-        req.goal = Point(x=float(dx), y=float(dy), z=float(dz))
-        req.yaw = float(dyaw_deg)
-        req.duration = _seconds_to_duration(self._dp('goto_duration_s'))
-        req.group_mask = 0
-        fut = self._goto_cli.call_async(req)
-        fut.add_done_callback(
-            lambda f: self._on_response(
-                f'nudge dx={dx:+.2f} dy={dy:+.2f} dz={dz:+.2f} dyaw={dyaw_deg:+.1f}',
-                f,
-            )
-        )
+        req = self.goto_request(dx, dy, dz, dyaw_deg,
+                                self._dp('goto_duration_s'), relative=True)
+        self._dispatch(
+            self.goto_cli, req,
+            f'nudge dx={dx:+.2f} dy={dy:+.2f} dz={dz:+.2f} dyaw={dyaw_deg:+.1f}',
+            'go_to: service not available')
 
     def call_goto_abs(
         self, x: float, y: float, z: float, yaw_deg: float = 0.0
     ) -> None:
-        if not self._goto_cli.service_is_ready():
-            self.events.put('go_to: service not available')
-            return
-        req = GoTo.Request()
-        req.relative = False
-        req.goal = Point(x=float(x), y=float(y), z=float(z))
-        req.yaw = float(yaw_deg)
-        req.duration = _seconds_to_duration(self._dp('goto_duration_s'))
-        req.group_mask = 0
-        fut = self._goto_cli.call_async(req)
-        fut.add_done_callback(
-            lambda f: self._on_response(
-                f'goto x={x:+.2f} y={y:+.2f} z={z:+.2f} yaw={yaw_deg:+.1f}',
-                f,
-            )
-        )
+        req = self.goto_request(x, y, z, yaw_deg,
+                                self._dp('goto_duration_s'), relative=False)
+        self._dispatch(
+            self.goto_cli, req,
+            f'goto x={x:+.2f} y={y:+.2f} z={z:+.2f} yaw={yaw_deg:+.1f}',
+            'go_to: service not available')
 
     def call_spiral(
         self,
@@ -220,28 +135,16 @@ class BridgeClient(Node):
         sideways: bool = False,
         clockwise: bool = False,
     ) -> None:
-        if not self._spiral_cli.service_is_ready():
-            self.events.put('spiral: service not available')
-            return
-        req = Spiral.Request()
-        req.angle = float(angle_deg)
-        req.r0 = float(r0)
-        req.rf = float(rf)
-        req.ascent = float(ascent)
-        req.duration = _seconds_to_duration(duration_s)
-        req.sideways = bool(sideways)
-        req.clockwise = bool(clockwise)
-        req.group_mask = 0
-        fut = self._spiral_cli.call_async(req)
-        fut.add_done_callback(
-            lambda f: self._on_response(
-                f'spiral angle={angle_deg:+.1f} r0={r0:.2f} rf={rf:.2f} '
-                f'ascent={ascent:+.2f}'
-                + (' sideways' if sideways else '')
-                + (' cw' if clockwise else ' ccw'),
-                f,
-            )
+        req = self.spiral_request(angle_deg, r0, rf, ascent, duration_s,
+                                  sideways=sideways, clockwise=clockwise)
+        label = (
+            f'spiral angle={angle_deg:+.1f} r0={r0:.2f} rf={rf:.2f} '
+            f'ascent={ascent:+.2f}'
+            + (' sideways' if sideways else '')
+            + (' cw' if clockwise else ' ccw')
         )
+        self._dispatch(self.spiral_cli, req, label,
+                       'spiral: service not available')
 
     @property
     def spiral_duration(self) -> float:
@@ -432,7 +335,6 @@ class CrazyBridgeTUI(App):
         Binding('t', 'takeoff', 'Takeoff'),
         Binding('l', 'land', 'Land'),
         Binding('k', 'kill', 'Kill'),
-        Binding('p', 'test', 'Test'),
         Binding('w', 'nudge_fwd', '+X'),
         Binding('s', 'nudge_back', '-X'),
         Binding('a', 'nudge_left', '+Y'),
@@ -506,9 +408,6 @@ class CrazyBridgeTUI(App):
 
     def action_kill(self) -> None:
         self._client.call_kill()
-
-    def action_test(self) -> None:
-        self._client.call_test()
 
     def action_land(self) -> None:
         self._client.call_land()
