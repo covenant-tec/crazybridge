@@ -70,6 +70,12 @@ class Rerun(Node):
 
 
     def _pos_err_cb(self, msg: Vector3):
+        if abs(msg.x) > 3:
+            msg.x = 0.0
+        if abs(msg.y) > 3:
+            msg.y = 0.0
+        if abs(msg.z) > 3:
+            msg.z = 0.0
         rr.log("/errors/pos/x", rr.Scalars(msg.x))
         rr.log("/errors/pos/y", rr.Scalars(msg.y))
         rr.log("/errors/pos/z", rr.Scalars(msg.z))
@@ -85,9 +91,9 @@ class Rerun(Node):
         # Arrow vector is a displacement from the origin, so rotate the drone's
         # body-frame forward axis (+x) into the world frame and scale it. This
         # makes the arrow tip track the drone's heading regardless of position.
-        arrow_length = 2.0
+        arrow_length = 0.2
         vector = rot.apply([1.0, 0.0, 0.0]) * arrow_length
-        rr.log("drone", rr.Arrows3D(origins=[start], vectors=[vector], radii=[0.05]))
+        rr.log("drone", rr.Arrows3D(origins=[start], vectors=[vector], radii=[0.01]))
         rr.log("/orientation/w", rr.Scalars(w))
         rr.log("/orientation/x", rr.Scalars(x))
         rr.log("/orientation/y", rr.Scalars(y))

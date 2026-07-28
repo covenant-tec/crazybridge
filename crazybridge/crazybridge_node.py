@@ -13,7 +13,7 @@ import os
 import threading
 
 import rclpy
-from time import sleep
+from time import sleep, time
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
@@ -30,6 +30,8 @@ from geometry_msgs.msg import PointStamped, Vector3, Quaternion, PointStamped, P
 from nav_msgs.msg import Odometry
 
 from crazybridge_interfaces.srv import GoTo, Land, Spiral, Takeoff
+
+from crazybridge.interface import BridgePublishers, Create
 
 logger = getLogger()
 
@@ -64,6 +66,7 @@ class CrazyBridge(Node):
         self.declare_parameter('child_frame_id', 'crazyflie')
         self.declare_parameter('pid_conf_path', '')
         self.declare_parameter('load_pid_conf', True)
+        self.declare_parameter('max_distance_from_origin', 3.0)
 
         self._uri = self.get_parameter(
             'uri').get_parameter_value().string_value
@@ -72,6 +75,7 @@ class CrazyBridge(Node):
                 'log_period_ms').get_parameter_value().integer_value,
             'log_period_ms',
         )
+        self._max_distance_from_origin = self.get_parameter("max_distance_from_origin").get_parameter_value().double_value
         self._oot_log_period_ms = self._sanitise_log_period(
             self.get_parameter(
                 'oot_log_period_ms').get_parameter_value().integer_value,
@@ -101,11 +105,22 @@ class CrazyBridge(Node):
         self._oot_q_err = (0.0, 0.0, 0.0, 1.0)  # (x, y, z, w)
         self._oot_qd = (0.0, 0.0, 0.0, 1.0)     # (x, y, z, w)
 
+        self._marker_id: int = None
+        self._safe_to_fly: bool = False
+        self._bad_marker_counter: int = 0
+        self._last_seen_marker: float = 0
+        self._safe_to_fly_lock = threading.Lock()
+
         self._odom_pub = self.create_publisher(Odometry, '~/odometry', 1)
         self._batt_pub = self.create_publisher(Float32, '~/battery', 1)
         self._thrust_pub = self.create_publisher(Float32, 'thrust', 1)
         self.torque_pub = self.create_publisher(Vector3, 'torque', 1)
         self._trans_error_pub = self.create_publisher(Vector3, 'pos_error', 1)
+        # Controller setpoint (ctrltarget.*): the planned/reference position the
+        # high-level commander feeds the controller. Config-independent (a core
+        # firmware log group), so it is the trajectory to overlay against the
+        # measured path in the controller-comparison test.
+        self._setpoint_pub = self.create_publisher(PointStamped, 'setpoint', 1)
         self._qd_pub = self.create_publisher(
             Quaternion, 'orientation/desired', 1)
         self._qe_pub = self.create_publisher(
@@ -151,6 +166,8 @@ class CrazyBridge(Node):
                 f'Timed out connecting to {self._uri} after {timeout}s '
                 f'({self._connect_error or "no failure callback fired"})'
             )
+            return
+        self._safety_interval = self.create_timer(1, self._safety_check)
 
     def _on_console(self, text):
         self.get_logger().info(text)
@@ -218,16 +235,31 @@ class CrazyBridge(Node):
         self._pm_log = LogConfig(name="battery", period_in_ms=extra_period)
         self._pm_log.add_variable("pm.batteryLevel", "uint8_t")
 
+        # ctrltarget.* is the controller's desired position (the planned
+        # trajectory the high-level commander is driving toward). It is a core
+        # firmware log group, so it is populated regardless of which controller
+        # or gain set is active -- ideal as the reference to compare the flown
+        # path against.
+        self._setpoint_log = LogConfig(
+            name='ctrltarget', period_in_ms=self._log_period_ms)
+        self._setpoint_log.add_variable('ctrltarget.x', 'float')
+        self._setpoint_log.add_variable('ctrltarget.y', 'float')
+        self._setpoint_log.add_variable('ctrltarget.z', 'float')
+
         try:
             self._cf.log.add_config(self._pos_log)
             self._cf.log.add_config(self._q_log)
             self._cf.log.add_config(self._pm_log)
+            self._cf.log.add_config(self._setpoint_log)
             self._pos_log.data_received_cb.add_callback(self._on_pos_log)
             self._q_log.data_received_cb.add_callback(self._on_q_log)
             self._pm_log.data_received_cb.add_callback(self._on_pm_log)
+            self._setpoint_log.data_received_cb.add_callback(
+                self._on_setpoint_log)
             self._pos_log.start()
             self._q_log.start()
             self._pm_log.start()
+            self._setpoint_log.start()
         except Exception as exc:
             self.get_logger().error(f'Failed to register log blocks: {exc}')
 
@@ -297,6 +329,15 @@ class CrazyBridge(Node):
         batt_msg = Float32()
         batt_msg.data = float(data["pm.batteryLevel"])
         self._batt_pub.publish(batt_msg)
+
+    def _on_setpoint_log(self, _timestamp, data, _logconf):
+        msg = PointStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self._odom_frame
+        msg.point.x = float(data['ctrltarget.x'])
+        msg.point.y = float(data['ctrltarget.y'])
+        msg.point.z = float(data['ctrltarget.z'])
+        self._setpoint_pub.publish(msg)
 
     def _on_input_log(self, _timestamp, data, _logconf):
         thrust_msg = Float32()
@@ -380,9 +421,49 @@ class CrazyBridge(Node):
 
     def _marker_cb(self, msg: PointStamped) -> None:
         header: Header = msg.header
+        if self._marker_id is None:
+            self._marker_id = header.frame_id
+        if self._marker_id != header.frame_id:
+            return
         point: Point = msg.point
+        axis = [point.x, point.y, point.z]
+        over_limit = [abs(i) > self._max_distance_from_origin for i in axis]
+        if any(over_limit):
+            print(over_limit)
+            self._bad_marker_counter += 1
+            return
+        self._last_seen_marker = time()
+        self._bad_marker_counter = self._bad_marker_counter -1 if self._bad_marker_counter > 0 else 0
         if self._cf.connected:
             self._cf.extpos.send_extpos(point.x, point.y, point.z)
+
+    def _safety_check(self):
+        if not self._cf.is_connected():
+            self.get_logger().error("Disconnected from crazyflie. Trying to reconnect")
+            with self._safe_to_fly:
+                self._cf.open_link(self._uri)
+                if self._connected.wait(timeout=1):
+                    self.get_logger().error("LANDING!!")
+                    if self._pos[2] > 0.1:
+                        self._cf.high_level_commander.land(0, 2)
+                        sleep(5)
+                    self._cf.supervisor.send_emergency_stop()
+
+        if self._marker_id is None: 
+            return
+        time_diff = time() - self._last_seen_marker
+        if time_diff > 2 or self._bad_marker_counter > 10:
+            with self._safe_to_fly_lock:
+                self.get_logger().error(f"Bad marker detected. Not seen for {time_diff} and had {self._bad_marker_counter} infractions")
+                if self._safe_to_fly:
+                    self._safe_to_fly = False
+                    self.get_logger().error("LANDING!!")
+                    self._cf.high_level_commander.land(0, 2)
+                    sleep(5)
+                    self._cf.supervisor.send_emergency_stop()
+            return
+        with self._safe_to_fly_lock:
+            self._safe_to_fly = True
 
     def _on_connection_failed(self, link_uri: str, msg: str) -> None:
         self._connect_error = msg
@@ -539,11 +620,10 @@ class CrazyBridge(Node):
             response.success = True
             response.message = ''
         except Exception as exc:
-            self.get_logger().error(f'land failed: {exc}')
+            self.get_logger().error(f'Kill failed: {exc}')
             response.success = False
             response.message = str(exc)
         return response
-
 
     def _land_cb(
         self, request: Land.Request, response: Land.Response
@@ -632,7 +712,7 @@ class CrazyBridge(Node):
 
     def shutdown(self) -> None:
         for name in (
-            '_pos_log', '_q_log',
+            '_pos_log', '_q_log', '_setpoint_log',
             '_pos_err_log', '_q_err_log', '_qd_log', '_ang_vel_err_log',
         ):
             log = getattr(self, name, None)

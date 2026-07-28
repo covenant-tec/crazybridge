@@ -61,6 +61,7 @@ class BridgeClient(Node):
         self.declare_parameter('goto_srv', '/crazybridge/go_to')
         self.declare_parameter('spiral_srv', '/crazybridge/spiral')
         self.declare_parameter('kill_srv', '/crazybridge/kill')
+        self.declare_parameter('test_srv', '/crazybridge/test')
 
         self.declare_parameter('takeoff_height_m', 1.0)
         self.declare_parameter('takeoff_duration_s', 2.0)
@@ -77,6 +78,7 @@ class BridgeClient(Node):
 
         self._takeoff_cli = self.create_client(Takeoff, self._sp('takeoff_srv'))
         self._kill_cli = self.create_client(SetBool, self._sp('kill_srv'))
+        self._test_cli = self.create_client(SetBool, self._sp('test_srv'))
         self._land_cli = self.create_client(Land, self._sp('land_srv'))
         self._goto_cli = self.create_client(GoTo, self._sp('goto_srv'))
         self._spiral_cli = self.create_client(Spiral, self._sp('spiral_srv'))
@@ -107,6 +109,7 @@ class BridgeClient(Node):
             'go_to': self._goto_cli.service_is_ready(),
             'spiral': self._spiral_cli.service_is_ready(),
             'kill': self._kill_cli.service_is_ready(),
+            'test': self._test_cli.service_is_ready(),
         }
 
     def _on_response(self, label: str, future) -> None:
@@ -145,6 +148,17 @@ class BridgeClient(Node):
         fut = self._kill_cli.call_async(req)
         fut.add_done_callback(
             lambda f: self._on_response(f'Killed! {f.message}')
+        )
+
+    def call_test(self) -> None:
+        if not self._test_cli.service_is_ready():
+            self.events.put('Test: service not available')
+            return
+        req = SetBool.Request()
+        req.data = True
+        fut = self._test_cli.call_async(req)
+        fut.add_done_callback(
+            lambda f: self._on_response(f'Testing! {f.message}')
         )
 
     def call_land(self) -> None:
@@ -418,6 +432,7 @@ class CrazyBridgeTUI(App):
         Binding('t', 'takeoff', 'Takeoff'),
         Binding('l', 'land', 'Land'),
         Binding('k', 'kill', 'Kill'),
+        Binding('p', 'test', 'Test'),
         Binding('w', 'nudge_fwd', '+X'),
         Binding('s', 'nudge_back', '-X'),
         Binding('a', 'nudge_left', '+Y'),
@@ -491,6 +506,9 @@ class CrazyBridgeTUI(App):
 
     def action_kill(self) -> None:
         self._client.call_kill()
+
+    def action_test(self) -> None:
+        self._client.call_test()
 
     def action_land(self) -> None:
         self._client.call_land()
