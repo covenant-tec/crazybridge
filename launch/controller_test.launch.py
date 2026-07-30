@@ -2,8 +2,12 @@
 
 Brings up OptiTrack + the crazybridge (loading the config's ``pid.conf``) + the
 rerun viewer (live planned-vs-actual overlay) + the ``controller_test`` node,
-which flies the fixed sequence, records the metrics for this config into
-``output_dir`` and then exits.
+which flies the fixed sequence, records this config's results into
+``<output_dir>/<config_name>/`` and then exits.
+
+``config_name`` drives three things: the run folder under ``output_dir``, the
+gains recorded inside it, and the rerun application id (``crazybridge/<name>``)
+so the run is easy to find in the live viewer.
 
 Drive one run per config, e.g.::
 
@@ -38,13 +42,15 @@ def generate_launch_description() -> LaunchDescription:
     args = [
         DeclareLaunchArgument(
             'config_name', default_value='default',
-            description='Label for this run; names the output files.'),
+            description='Label for this run; names the output folder and the '
+                        'rerun recording.'),
         DeclareLaunchArgument(
             'pid_conf_path', default_value=default_pid_conf,
             description='OOT gain file to load for this run.'),
         DeclareLaunchArgument(
             'output_dir', default_value='/tmp/ctrl_test',
-            description='Directory for *_metrics.json/.csv and *_traj.npz.'),
+            description='Parent directory; this run writes into '
+                        '<output_dir>/<config_name>/.'),
         DeclareLaunchArgument(
             'uri', default_value='radio://0/100/2M',
             description='cflib URI (hardware default; sim = udp://127.0.0.1:19850).'),
@@ -93,6 +99,9 @@ def generate_launch_description() -> LaunchDescription:
             'rerun_mode': LaunchConfiguration('rerun_mode'),
             'rerun_addr': LaunchConfiguration('rerun_addr'),
             'rerun_save_path': LaunchConfiguration('rerun_save_path'),
+            # Names the recording after the config, so the run is easy to pick
+            # out in the live viewer.
+            'run_name': LaunchConfiguration('config_name'),
         }],
     )
 
@@ -108,6 +117,8 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[{
             'config_name': LaunchConfiguration('config_name'),
             'output_dir': LaunchConfiguration('output_dir'),
+            # Same gain file the bridge loads; recorded with the metrics.
+            'pid_conf_path': LaunchConfiguration('pid_conf_path'),
             'takeoff_height_m': LaunchConfiguration('takeoff_height_m'),
             'goal_xyz': LaunchConfiguration('goal_xyz'),
             'circle_radius_m': LaunchConfiguration('circle_radius_m'),

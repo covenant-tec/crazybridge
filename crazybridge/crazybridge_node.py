@@ -32,6 +32,7 @@ from nav_msgs.msg import Odometry
 from crazybridge_interfaces.srv import GoTo, Land, Spiral, Takeoff
 
 from crazybridge.interface import BridgePublishers, Create
+from crazybridge.pid_conf import PidConf
 
 logger = getLogger()
 
@@ -41,13 +42,7 @@ PARAM_CONTROLLER = 'stabilizer.controller'
 ESTIMATOR_KALMAN = 2
 ESTIMATOR_COMPLEMENTARY = 1
 
-OOT_PARAM_GROUP = 'ootParams'
-OOT_TRANS_KP = ('trans_kp_x', 'trans_kp_y', 'trans_kp_z')
-OOT_TRANS_KD = ('trans_kd_x', 'trans_kd_y', 'trans_kd_z')
-OOT_TRANS_KI = ('trans_ki_x', 'trans_ki_y', 'trans_ki_z')
-OOT_ROT_KP = ('rot_kp_x', 'rot_kp_y', 'rot_kp_z')
-OOT_ROT_KD = ('rot_kd_x', 'rot_kd_y', 'rot_kd_z')
-OOT_ROT_KI = ('rot_ki_x', 'rot_ki_y', 'rot_ki_z')
+# The ootParams gain names live in crazybridge.pid_conf.LAYOUT.
 
 
 class CrazyBridge(Node):
@@ -121,9 +116,10 @@ class CrazyBridge(Node):
             PointStamped, Create.MARKER, self._marker_cb,
             QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         )
-
-        self._takeoff_srv = self.create_service(
-            Takeoff, Create.SRV_TAKEOFF, self._takeoff_cb)
+        self._takeoff_srv=None
+       # self._safe_to_fly = True
+       # self._takeoff_srv = self.create_service(
+       #             Takeoff, Create.SRV_TAKEOFF, self._takeoff_cb)
         self._land_srv = self.create_service(
             Land, Create.SRV_LAND, self._land_cb)
         self._goto_srv = self.create_service(
@@ -224,8 +220,8 @@ class CrazyBridge(Node):
         self._q_log.add_variable('kalman.q3', 'float')
 
         extra_period = self._sanitise_log_period(500, "extra_log_ms")
-#        self._pm_log = LogConfig(name="battery", period_in_ms=extra_period)
-#        self._pm_log.add_variable("pm.batteryLevel", "uint8_t")
+        self._pm_log = LogConfig(name="battery", period_in_ms=extra_period)
+        self._pm_log.add_variable("pm.batteryLevel", "uint8_t")
 
         # ctrltarget.* is the controller's desired position (the planned
         # trajectory the high-level commander is driving toward). It is a core
@@ -241,16 +237,16 @@ class CrazyBridge(Node):
         try:
             self._cf.log.add_config(self._pos_log)
             self._cf.log.add_config(self._q_log)
-#            self._cf.log.add_config(self._pm_log)
+            self._cf.log.add_config(self._pm_log)
             self._cf.log.add_config(self._setpoint_log)
             self._pos_log.data_received_cb.add_callback(self._on_pos_log)
             self._q_log.data_received_cb.add_callback(self._on_q_log)
-#            self._pm_log.data_received_cb.add_callback(self._on_pm_log)
+            self._pm_log.data_received_cb.add_callback(self._on_pm_log)
             self._setpoint_log.data_received_cb.add_callback(
                 self._on_setpoint_log)
             self._pos_log.start()
             self._q_log.start()
-#            self._pm_log.start()
+            self._pm_log.start()
             self._setpoint_log.start()
         except Exception as exc:
             self.get_logger().error(f'Failed to register log blocks: {exc}')
@@ -343,68 +339,16 @@ class CrazyBridge(Node):
         self._pubs.torque.publish(torque_msg)
 
     def _apply_pid_conf(self, path: str) -> None:
-        if not os.path.isfile(path):
-            raise FileNotFoundError(path)
-
-        values: list[float] = []
-        with open(path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                values.append(float(line))
-
-        if len(values) < 12:
-            raise ValueError(
-                f'pid.conf {path} needs 12 numeric values, got {len(values)}'
-            )
-
-        trans_kp = values[0:3]
-        trans_kd = values[3:6]
-        trans_ki = values[6:9]
-        trans_h = values[9:12]
-        rot_kp = values[12:15]
-        rot_kd = values[15:18]
-        rot_ki = values[18:21]
-        rot_h = values[21:24]
+        # PidConf owns the file layout (24 values -> ootParams names) so the
+        # bridge and controller_test cannot disagree about what a run flew with.
+        conf = PidConf.load(path)
 
         self.get_logger().info(f'Loading PID gains from {path}')
-        self.get_logger().info(f'  trans kp = {trans_kp}, kd = {trans_kd}, ki = {trans_ki}')  # noqa
-        self.get_logger().info(f'  trans homogenous   emax = {trans_h[0]} mu = {trans_h[1]} gamma = {trans_h[2]}')  # noqa
-        self.get_logger().info(f'  rot   kp = {rot_kp}, kd = {rot_kd}, ki = {rot_ki}')  # noqa
-        self.get_logger().info(f'  rot homogenous   emax = {rot_h[0]} mu = {rot_h[1]} gamma = {rot_h[2]}')  # noqa
+        for line in conf.describe():
+            self.get_logger().info(line)
 
-        self._cf.param.set_value("ootParams.trans_kp_x", trans_kp[0])
-        self._cf.param.set_value("ootParams.trans_kp_y", trans_kp[1])
-        self._cf.param.set_value("ootParams.trans_kp_z", trans_kp[2])
-
-        self._cf.param.set_value("ootParams.trans_kd_x", trans_kd[0])
-        self._cf.param.set_value("ootParams.trans_kd_y", trans_kd[1])
-        self._cf.param.set_value("ootParams.trans_kd_z", trans_kd[2])
-
-        self._cf.param.set_value("ootParams.trans_ki_x", trans_ki[0])
-        self._cf.param.set_value("ootParams.trans_ki_y", trans_ki[1])
-        self._cf.param.set_value("ootParams.trans_ki_z", trans_ki[2])
-
-        self._cf.param.set_value("ootParams.trans_emax", trans_h[0])
-        self._cf.param.set_value("ootParams.trans_mu", trans_h[1])
-        self._cf.param.set_value("ootParams.trans_gamma", trans_h[2])
-
-        self._cf.param.set_value("ootParams.rot_kp_x", rot_kp[0])
-        self._cf.param.set_value("ootParams.rot_kp_y", rot_kp[1])
-        self._cf.param.set_value("ootParams.rot_kp_z", rot_kp[2])
-
-        self._cf.param.set_value("ootParams.rot_kd_x", rot_kd[0])
-        self._cf.param.set_value("ootParams.rot_kd_y", rot_kd[1])
-        self._cf.param.set_value("ootParams.rot_kd_z", rot_kd[2])
-
-        self._cf.param.set_value("ootParams.rot_ki_x", rot_ki[0])
-        self._cf.param.set_value("ootParams.rot_ki_y", rot_ki[1])
-        self._cf.param.set_value("ootParams.rot_ki_z", rot_ki[2])
-
-        self._cf.param.set_value("ootParams.rot_emax", rot_h[0])
-        self._cf.param.set_value("ootParams.rot_mu", rot_h[1])
-        self._cf.param.set_value("ootParams.rot_gamma", rot_h[2])
+        for name, value in conf.params():
+            self._cf.param.set_value(name, value)
 
         self.get_logger().info('Done configuring PID')
 
@@ -432,7 +376,7 @@ class CrazyBridge(Node):
     def _safety_check(self):
         if not self._cf.is_connected():
             self.get_logger().error("Disconnected from crazyflie. Trying to reconnect")
-            with self._safe_to_fly:
+            with self._safe_to_fly_lock:
                 self._cf.open_link(self._uri)
                 if self._connected.wait(timeout=1):
                     self.get_logger().error("LANDING!!")
@@ -455,6 +399,9 @@ class CrazyBridge(Node):
                     self._cf.supervisor.send_emergency_stop()
             return
         with self._safe_to_fly_lock:
+            if not self._takeoff_srv:
+                self._takeoff_srv = self.create_service(
+                    Takeoff, Create.SRV_TAKEOFF, self._takeoff_cb)
             self._safe_to_fly = True
 
     def _on_connection_failed(self, link_uri: str, msg: str) -> None:
@@ -579,6 +526,13 @@ class CrazyBridge(Node):
     def _takeoff_cb(
         self, request: Takeoff.Request, response: Takeoff.Response
     ) -> Takeoff.Response:
+        if not self._safe_to_fly:
+            # Must still answer, or rclpy raises TypeError on send_response and
+            # tears down the spin loop (killing the link).
+            self.get_logger().warning('takeoff refused: not safe to fly')
+            response.success = False
+            response.message = 'not safe to fly'
+            return response
         duration = self._duration_to_seconds(request.duration)
         self.get_logger().info(
             f'takeoff height={request.height:.2f}m duration={duration:.2f}s '
@@ -603,7 +557,9 @@ class CrazyBridge(Node):
         self, request: SetBool.Request, response: SetBool.Response
     ) -> Land.Response:
         if not request.data:
-            return 
+            response.success = False
+            response.message = 'kill not requested (data=false)'
+            return response
         self.get_logger().info(
             f'Kill!'
         )

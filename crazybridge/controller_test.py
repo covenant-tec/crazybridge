@@ -10,8 +10,17 @@ node records the control signals (``thrust``, ``torque``), the position error
 (``pos_error``), the flown path (``odometry``, via the base node's hook) and the
 planned reference path (``setpoint`` = firmware ``ctrltarget``). When the
 sequence finishes it hands the samples to :mod:`crazybridge.metrics`, which
-writes ``<config>_metrics.json`` / ``.csv`` and ``<config>_traj.npz`` to
-``output_dir``.
+writes one folder per run::
+
+    <output_dir>/<config_name>/metrics.json   # metrics + the gains flown
+                              /metrics.csv
+                              /traj.npz
+                              /pid.conf       # verbatim copy of the gain file
+
+The filenames are identical across runs -- the folder name carries the config.
+``pid_conf_path`` should be the same gain file the bridge was launched with; the
+node parses it (via :class:`crazybridge.pid_conf.PidConf`) and stores the gains
+in ``metrics.json`` so results are never orphaned from the gains behind them.
 
 Visualisation is left to the ``rerun`` node (launched alongside), which draws the
 planned-vs-actual paths live from the same ``setpoint`` / ``odometry`` topics.
@@ -37,6 +46,7 @@ from std_msgs.msg import Float32
 
 from crazybridge import metrics
 from crazybridge.interface import BridgeClientNode, Topics
+from crazybridge.pid_conf import PidConf
 
 
 class ControllerTest(BridgeClientNode):
@@ -49,6 +59,9 @@ class ControllerTest(BridgeClientNode):
         # identity / output
         self.declare_parameter('config_name', 'default')
         self.declare_parameter('output_dir', '/tmp/ctrl_test')
+        # The same pid.conf the bridge loaded; recorded alongside the metrics so
+        # a run's numbers can be traced back to the gains that produced them.
+        self.declare_parameter('pid_conf_path', '')
 
         # telemetry topic names (odom_topic comes from the base)
         self.declare_parameter('setpoint_topic', Topics.SETPOINT)
@@ -230,10 +243,29 @@ class ControllerTest(BridgeClientNode):
             'clockwise': getattr(self, '_clockwise', False),
         }
 
+    def _gains(self) -> tuple[dict | None, str]:
+        """The gains this run flew with, as ``(flat dict | None, path)``."""
+        path = self._sp('pid_conf_path')
+        if not path:
+            self.get_logger().warning(
+                'pid_conf_path not set; run will be recorded without gains')
+            return None, ''
+        try:
+            conf = PidConf.load(path)
+        except Exception as exc:
+            self.get_logger().error(f'could not read gains from {path}: {exc}')
+            return None, path
+        return conf.as_dict(), path
+
     def report(self, ts: dict) -> dict:
         m = metrics.compute_metrics(self._samples(), ts)
-        metrics.write_reports(
-            self._sp('output_dir'), self._sp('config_name'), ts, m, self._traj())
+        gains, pid_conf_path = self._gains()
+        config = self._sp('config_name')
+        out_dir = self._sp('output_dir')
+        metrics.write_reports(out_dir, config, ts, m, self._traj(),
+                              gains=gains, pid_conf_path=pid_conf_path)
+        self.get_logger().info(
+            f'wrote run artefacts to {metrics.run_dir(out_dir, config)}')
         return m
 
 

@@ -19,6 +19,11 @@ class Rerun(Node):
         self.declare_parameter('rerun_app_id', 'crazybridge')
         self.declare_parameter('rerun_addr', '')
         self.declare_parameter('rerun_save_path', '')
+        # Name of the run being flown (the controller_test config_name). When
+        # set, the rerun application id becomes '<app_id>/<run_name>' so each
+        # config shows up as its own entry in the live viewer's recording list
+        # instead of every run piling into one 'crazybridge' stream.
+        self.declare_parameter('run_name', '')
         # Cap on how many points to keep in each trajectory line strip so a long
         # session does not grow the log unbounded.
         self.declare_parameter('path_max_points', 5000)
@@ -212,10 +217,15 @@ class Rerun(Node):
         mode = self.get_parameter('rerun_mode').get_parameter_value().string_value.strip().lower()
         app_id = self.get_parameter(
             'rerun_app_id').get_parameter_value().string_value or 'crazybridge'
+        run_name = self.get_parameter(
+            'run_name').get_parameter_value().string_value.strip()
+        if run_name:
+            app_id = f'{app_id}/{run_name}'
         self._rerun_enabled = mode != 'disabled'
         if not self._rerun_enabled:
             return
 
+        self.get_logger().info(f'rerun application id: {app_id}')
         rr.init(app_id)
         try:
             if mode == 'spawn':

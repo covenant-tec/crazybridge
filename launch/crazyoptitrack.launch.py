@@ -15,7 +15,7 @@ def generate_launch_description() -> LaunchDescription:
 
     uri_arg = DeclareLaunchArgument(
         'uri',
-        default_value='radio://0/100/2M',
+        default_value='radio://0/80/2M/E7E7E7E702',
         description='cflib URI for the Crazyflie (default targets CrazySim SITL).',
     )
     log_period_arg = DeclareLaunchArgument(
@@ -43,18 +43,18 @@ def generate_launch_description() -> LaunchDescription:
     )
     rerun_mode_arg = DeclareLaunchArgument(
         'rerun_mode',
-        default_value='spawn',
+        default_value='connect',
         description=(
             "How to attach to rerun: 'spawn' (launches a viewer), "
             "'connect' (attach to running viewer at rerun_addr), "
             "'save' (write to rerun_save_path), 'disabled'."
         ),
     )
-#    rerun_addr_arg = DeclareLaunchArgument(
-#        'rerun_addr',
-#        default_value='rerun+http://10.43.100.150:9876/proxy',
-#        description='gRPC address for rerun_mode=connect (empty = default).',
-#    )
+    rerun_addr_arg = DeclareLaunchArgument(
+        'rerun_addr',
+        default_value='rerun+http://10.242.79.176:9876/proxy',
+        description='gRPC address for rerun_mode=connect (empty = default).',
+    )
     rerun_save_path_arg = DeclareLaunchArgument(
         'rerun_save_path',
         default_value='',
@@ -76,7 +76,7 @@ def generate_launch_description() -> LaunchDescription:
         pid_conf_arg,
         load_pid_conf_arg,
         rerun_mode_arg,
-        #rerun_addr_arg,
+        rerun_addr_arg,
         rerun_save_path_arg,
         rerun_oot_decimate_arg,
         Node(
@@ -99,7 +99,7 @@ def generate_launch_description() -> LaunchDescription:
             output='screen',
             parameters=[{
                 'rerun_mode': LaunchConfiguration('rerun_mode'),
-                #'rerun_addr': LaunchConfiguration('rerun_addr'),
+                'rerun_addr': LaunchConfiguration('rerun_addr'),
                 'rerun_save_path': LaunchConfiguration('rerun_save_path'),
             }]
         ),
