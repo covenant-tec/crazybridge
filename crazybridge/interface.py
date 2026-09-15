@@ -14,62 +14,74 @@ Two views of each name exist:
 resolves to ``/thrust``. Both forms are listed side by side below so they can
 never drift apart.
 """
+
 from __future__ import annotations
 
 import threading
 from time import monotonic, sleep
 
-from rclpy.node import Node
-
 from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import Point, PointStamped, Quaternion, Vector3
 from nav_msgs.msg import Odometry
+from rclpy.node import Node
 from std_msgs.msg import Float32
 from std_srvs.srv import SetBool
 
 from crazybridge_interfaces.srv import GoTo, Land, Spiral, Takeoff
 
-BRIDGE_NODE = 'crazybridge'
+BRIDGE_NODE = "crazybridge"
+
+
+class TrackingMode:
+    """Supported external motion capture tracking modes."""
+    AUTO = "auto"
+    RIGID_BODY = "rigid_body"
+    MARKER = "marker"
 
 
 class Create:
     """Names the bridge node passes to create_publisher / create_service."""
-    ODOM = '~/odometry'
-    BATTERY = '~/battery'
-    THRUST = 'thrust'
-    TORQUE = 'torque'
-    POS_ERROR = 'pos_error'
-    SETPOINT = 'setpoint'
-    ORI_DESIRED = 'orientation/desired'
-    ORI_ERROR = 'orientation/error'
-    MARKER = 'optitrack/marker'
-    SRV_TAKEOFF = '~/takeoff'
-    SRV_LAND = '~/land'
-    SRV_GOTO = '~/go_to'
-    SRV_SPIRAL = '~/spiral'
-    SRV_KILL = '~/kill'
+
+    ODOM = "~/odometry"
+    BATTERY = "~/battery"
+    THRUST = "thrust"
+    TORQUE = "torque"
+    POS_ERROR = "pos_error"
+    SETPOINT = "setpoint"
+    ORI_DESIRED = "orientation/desired"
+    ORI_ERROR = "orientation/error"
+    MARKER = "optitrack/marker"
+    RIGID_BODY = "optitrack/rigid_body"
+    SRV_TAKEOFF = "~/takeoff"
+    SRV_LAND = "~/land"
+    SRV_GOTO = "~/go_to"
+    SRV_SPIRAL = "~/spiral"
+    SRV_KILL = "~/kill"
 
 
 class Topics:
     """Fully-qualified topic names for clients (TUI, test node, rerun)."""
-    ODOM = '/crazybridge/odometry'
-    BATTERY = '/crazybridge/battery'
-    THRUST = '/thrust'
-    TORQUE = '/torque'
-    POS_ERROR = '/pos_error'
-    SETPOINT = '/setpoint'
-    ORI_DESIRED = '/orientation/desired'
-    ORI_ERROR = '/orientation/error'
-    MARKER = '/optitrack/marker'
+
+    ODOM = "/crazybridge/odometry"
+    BATTERY = "/crazybridge/battery"
+    THRUST = "/thrust"
+    TORQUE = "/torque"
+    POS_ERROR = "/pos_error"
+    SETPOINT = "/setpoint"
+    ORI_DESIRED = "/orientation/desired"
+    ORI_ERROR = "/orientation/error"
+    MARKER = "/optitrack/marker"
+    RIGID_BODY = "/optitrack/rigid_body"
 
 
 class Services:
     """Fully-qualified service names for clients."""
-    TAKEOFF = '/crazybridge/takeoff'
-    LAND = '/crazybridge/land'
-    GOTO = '/crazybridge/go_to'
-    SPIRAL = '/crazybridge/spiral'
-    KILL = '/crazybridge/kill'
+
+    TAKEOFF = "/crazybridge/takeoff"
+    LAND = "/crazybridge/land"
+    GOTO = "/crazybridge/go_to"
+    SPIRAL = "/crazybridge/spiral"
+    KILL = "/crazybridge/kill"
 
 
 def seconds_to_duration(seconds: float) -> Duration:
@@ -94,9 +106,9 @@ class BridgePublishers:
         self.pos_error = node.create_publisher(Vector3, Create.POS_ERROR, 1)
         self.setpoint = node.create_publisher(PointStamped, Create.SETPOINT, 1)
         self.orientation_desired = node.create_publisher(
-            Quaternion, Create.ORI_DESIRED, 1)
-        self.orientation_error = node.create_publisher(
-            Quaternion, Create.ORI_ERROR, 1)
+            Quaternion, Create.ORI_DESIRED, 1
+        )
+        self.orientation_error = node.create_publisher(Quaternion, Create.ORI_ERROR, 1)
 
 
 class BridgeClientNode(Node):
@@ -113,17 +125,17 @@ class BridgeClientNode(Node):
     def __init__(self, node_name: str, *, subscribe_odometry: bool = True) -> None:
         super().__init__(node_name)
 
-        self.declare_parameter('takeoff_srv', Services.TAKEOFF)
-        self.declare_parameter('land_srv', Services.LAND)
-        self.declare_parameter('goto_srv', Services.GOTO)
-        self.declare_parameter('spiral_srv', Services.SPIRAL)
-        self.declare_parameter('kill_srv', Services.KILL)
+        self.declare_parameter("takeoff_srv", Services.TAKEOFF)
+        self.declare_parameter("land_srv", Services.LAND)
+        self.declare_parameter("goto_srv", Services.GOTO)
+        self.declare_parameter("spiral_srv", Services.SPIRAL)
+        self.declare_parameter("kill_srv", Services.KILL)
 
-        self.takeoff_cli = self.create_client(Takeoff, self._sp('takeoff_srv'))
-        self.land_cli = self.create_client(Land, self._sp('land_srv'))
-        self.goto_cli = self.create_client(GoTo, self._sp('goto_srv'))
-        self.spiral_cli = self.create_client(Spiral, self._sp('spiral_srv'))
-        self.kill_cli = self.create_client(SetBool, self._sp('kill_srv'))
+        self.takeoff_cli = self.create_client(Takeoff, self._sp("takeoff_srv"))
+        self.land_cli = self.create_client(Land, self._sp("land_srv"))
+        self.goto_cli = self.create_client(GoTo, self._sp("goto_srv"))
+        self.spiral_cli = self.create_client(Spiral, self._sp("spiral_srv"))
+        self.kill_cli = self.create_client(SetBool, self._sp("kill_srv"))
 
         # Odometry is the one subscription every client needs. The base keeps
         # the latest message; subclasses override on_odometry() to also record
@@ -131,9 +143,10 @@ class BridgeClientNode(Node):
         self._odom_lock = threading.Lock()
         self._latest_odom: Odometry | None = None
         if subscribe_odometry:
-            self.declare_parameter('odom_topic', Topics.ODOM)
+            self.declare_parameter("odom_topic", Topics.ODOM)
             self.create_subscription(
-                Odometry, self._sp('odom_topic'), self._ingest_odom, 10)
+                Odometry, self._sp("odom_topic"), self._ingest_odom, 10
+            )
 
     # -- parameter accessors -------------------------------------------------
     def _sp(self, name: str) -> str:
@@ -168,9 +181,11 @@ class BridgeClientNode(Node):
     # -- service introspection ----------------------------------------------
     def service_clients(self) -> dict:
         return {
-            'takeoff': self.takeoff_cli, 'land': self.land_cli,
-            'go_to': self.goto_cli, 'spiral': self.spiral_cli,
-            'kill': self.kill_cli
+            "takeoff": self.takeoff_cli,
+            "land": self.land_cli,
+            "go_to": self.goto_cli,
+            "spiral": self.spiral_cli,
+            "kill": self.kill_cli,
         }
 
     def service_ready(self) -> dict[str, bool]:
@@ -181,13 +196,15 @@ class BridgeClientNode(Node):
         deadline = monotonic() + timeout_s
         while monotonic() < deadline:
             if all(self.service_ready().values()) and (
-                    not require_odom or self.has_odometry()):
+                not require_odom or self.has_odometry()
+            ):
                 return
             sleep(0.1)
         missing = [n for n, r in self.service_ready().items() if not r]
         raise RuntimeError(
-            f'startup timeout after {timeout_s}s (missing services: {missing}, '
-            f'odometry: {self.has_odometry()})')
+            f"startup timeout after {timeout_s}s (missing services: {missing}, "
+            f"odometry: {self.has_odometry()})"
+        )
 
     # -- request builders (single source of truth for field layout) ----------
     @staticmethod
@@ -207,9 +224,15 @@ class BridgeClientNode(Node):
         return req
 
     @staticmethod
-    def goto_request(x: float, y: float, z: float, yaw_deg: float,
-                     duration_s: float, relative: bool = False,
-                     group_mask: int = 0):
+    def goto_request(
+        x: float,
+        y: float,
+        z: float,
+        yaw_deg: float,
+        duration_s: float,
+        relative: bool = False,
+        group_mask: int = 0,
+    ):
         req = GoTo.Request()
         req.relative = bool(relative)
         req.goal = Point(x=float(x), y=float(y), z=float(z))
@@ -219,9 +242,16 @@ class BridgeClientNode(Node):
         return req
 
     @staticmethod
-    def spiral_request(angle_deg: float, r0: float, rf: float, ascent: float,
-                       duration_s: float, sideways: bool = False,
-                       clockwise: bool = False, group_mask: int = 0):
+    def spiral_request(
+        angle_deg: float,
+        r0: float,
+        rf: float,
+        ascent: float,
+        duration_s: float,
+        sideways: bool = False,
+        clockwise: bool = False,
+        group_mask: int = 0,
+    ):
         req = Spiral.Request()
         req.angle = float(angle_deg)
         req.r0 = float(r0)

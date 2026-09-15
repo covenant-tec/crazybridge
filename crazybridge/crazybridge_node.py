@@ -2,43 +2,47 @@
 
 Mirrors crazybridge.cpp: brings up a cflib link (defaulting to the CrazySim
 UDP URI), enables the high-level commander and Kalman estimator, streams
-position + quaternion as nav_msgs/Odometry, forwards mocap marker fixes via
-the external-position channel, and exposes takeoff/land/go_to services that
+position + quaternion as nav_msgs/Odometry, forwards mocap marker/rigid-body fixes
+via the external-position channel, and exposes takeoff/land/go_to services that
 drive the high-level commander.
 """
+
 from __future__ import annotations
 
 import math
 import os
 import threading
-
-import rclpy
+from logging import getLogger
 from time import sleep, time
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 import cflib.crtp
+import rclpy
+from ament_index_python.packages import get_package_share_directory
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
-from logging import getLogger
-
-from ament_index_python.packages import get_package_share_directory
-
+from geometry_msgs.msg import (
+    Point,
+    PointStamped,
+    Pose,
+    PoseStamped,
+    Quaternion,
+    Vector3,
+)
+from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Float32, Header
 from std_srvs.srv import SetBool
-from geometry_msgs.msg import PointStamped, Vector3, Quaternion, PointStamped, Point
-from nav_msgs.msg import Odometry
 
-from crazybridge_interfaces.srv import GoTo, Land, Spiral, Takeoff
-
-from crazybridge.interface import BridgePublishers, Create
+from crazybridge.interface import BridgePublishers, Create, TrackingMode
 from crazybridge.pid_conf import PidConf
+from crazybridge_interfaces.srv import GoTo, Land, Spiral, Takeoff
 
 logger = getLogger()
 
-PARAM_HL_COMMANDER = 'commander.enHighLevel'
-PARAM_ESTIMATOR = 'stabilizer.estimator'
-PARAM_CONTROLLER = 'stabilizer.controller'
+PARAM_HL_COMMANDER = "commander.enHighLevel"
+PARAM_ESTIMATOR = "stabilizer.estimator"
+PARAM_CONTROLLER = "stabilizer.controller"
 ESTIMATOR_KALMAN = 2
 ESTIMATOR_COMPLEMENTARY = 1
 
@@ -47,47 +51,87 @@ ESTIMATOR_COMPLEMENTARY = 1
 
 class CrazyBridge(Node):
     def __init__(self) -> None:
-        super().__init__('crazybridge')
+        super().__init__("crazybridge")
 
-        self.declare_parameter('uri', 'udp://127.0.0.1:19850')
+        self.declare_parameter("uri", "radio://0/80/2M/E7E7E7E7E7")
         # cflib log periods are in real milliseconds; the firmware quantises
         # them to 10 ms ticks, so values must be a multiple of 10 and >= 10.
         # The C++ port called start(5)/start(1) which were raw 10 ms ticks,
         # i.e. 50 ms for pos/q and 10 ms for the OOT blocks.
-        self.declare_parameter('log_period_ms', 50)
-        self.declare_parameter('oot_log_period_ms', 10)
-        self.declare_parameter('connection_timeout_s', 10.0)
-        self.declare_parameter('odom_frame_id', 'world')
-        self.declare_parameter('child_frame_id', 'crazyflie')
-        self.declare_parameter('pid_conf_path', '')
-        self.declare_parameter('load_pid_conf', True)
-        self.declare_parameter('max_distance_from_origin', 3.0)
+        self.declare_parameter("log_period_ms", 50)
+        self.declare_parameter("oot_log_period_ms", 10)
+        self.declare_parameter("connection_timeout_s", 10.0)
+        self.declare_parameter("odom_frame_id", "world")
+        self.declare_parameter("child_frame_id", "crazyflie")
+        self.declare_parameter("pid_conf_path", "")
+        self.declare_parameter("load_pid_conf", True)
+        self.declare_parameter("max_distance_from_origin", 3.0)
+        self.declare_parameter("tracking_mode", TrackingMode.RIGID_BODY)
+        self.declare_parameter("rigid_body_id", "")
+        self.declare_parameter("marker_id", "")
 
-        self._uri = self.get_parameter(
-            'uri').get_parameter_value().string_value
+        self._uri = self.get_parameter("uri").get_parameter_value().string_value
         self._log_period_ms = self._sanitise_log_period(
-            self.get_parameter(
-                'log_period_ms').get_parameter_value().integer_value,
-            'log_period_ms',
+            self.get_parameter("log_period_ms").get_parameter_value().integer_value,
+            "log_period_ms",
         )
-        self._max_distance_from_origin = self.get_parameter("max_distance_from_origin").get_parameter_value().double_value
+        self._max_distance_from_origin = (
+            self.get_parameter("max_distance_from_origin")
+            .get_parameter_value()
+            .double_value
+        )
         self._oot_log_period_ms = self._sanitise_log_period(
-            self.get_parameter(
-                'oot_log_period_ms').get_parameter_value().integer_value,
-            'oot_log_period_ms',
+            self.get_parameter("oot_log_period_ms").get_parameter_value().integer_value,
+            "oot_log_period_ms",
         )
         self._odom_frame = (
-            self.get_parameter(
-                'odom_frame_id').get_parameter_value().string_value
+            self.get_parameter("odom_frame_id").get_parameter_value().string_value
         )
         self._child_frame = (
-            self.get_parameter(
-                'child_frame_id').get_parameter_value().string_value
+            self.get_parameter("child_frame_id").get_parameter_value().string_value
         )
-        self._pid_conf_path = self._resolve_pid_conf_path()
+
+        tracking_mode_raw = (
+            self.get_parameter("tracking_mode")
+            .get_parameter_value()
+            .string_value.strip()
+            .lower()
+        )
+        if tracking_mode_raw in (
+            TrackingMode.AUTO,
+            TrackingMode.RIGID_BODY,
+            TrackingMode.MARKER,
+        ):
+            self._tracking_mode = tracking_mode_raw
+        else:
+            self.get_logger().warning(
+                f"Unknown tracking_mode={tracking_mode_raw!r}; defaulting to {TrackingMode.RIGID_BODY}"
+            )
+            self._tracking_mode = TrackingMode.RIGID_BODY
+        self.get_logger().info(f"Configured tracking mode: {self._tracking_mode}")
+
+        rigid_id_raw = (
+            self.get_parameter("rigid_body_id")
+            .get_parameter_value()
+            .string_value.strip()
+        )
+        self._rigid_body_id: str | None = rigid_id_raw if rigid_id_raw else None
+
+        marker_id_raw = (
+            self.get_parameter("marker_id").get_parameter_value().string_value.strip()
+        )
+        self._marker_id: str | None = marker_id_raw if marker_id_raw else None
+
+        path_param = (
+            self.get_parameter("pid_conf_path")
+            .get_parameter_value()
+            .string_value.strip()
+        )
+        self._explicit_pid_conf_path: str | None = path_param if path_param else None
+        self._loaded_pid_source: str | None = None
+        self._pid_conf_path: str | None = self._resolve_pid_conf_path()
         self._load_pid_conf = bool(
-            self.get_parameter(
-                'load_pid_conf').get_parameter_value().bool_value
+            self.get_parameter("load_pid_conf").get_parameter_value().bool_value
         )
 
         self._pos = [0.0, 0.0, 0.0]
@@ -98,12 +142,15 @@ class CrazyBridge(Node):
         self._oot_lock = threading.Lock()
         self._oot_pos_err = (0.0, 0.0, 0.0)
         self._oot_q_err = (0.0, 0.0, 0.0, 1.0)  # (x, y, z, w)
-        self._oot_qd = (0.0, 0.0, 0.0, 1.0)     # (x, y, z, w)
+        self._oot_qd = (0.0, 0.0, 0.0, 1.0)  # (x, y, z, w)
 
-        self._marker_id: int = None
         self._safe_to_fly: bool = False
-        self._bad_marker_counter: int = 0
-        self._last_seen_marker: float = 0
+        self._bad_mocap_counter: int = 0
+        self._last_seen_rigid_body: float = 0.0
+        self._last_seen_marker: float = 0.0
+        self._last_seen_mocap: float = 0.0
+        self._mocap_locked: bool = False
+        self._active_source: str = "none"
         self._safe_to_fly_lock = threading.Lock()
 
         # Telemetry publishers (names/types live in interface.BridgePublishers,
@@ -112,47 +159,58 @@ class CrazyBridge(Node):
         # carry the OOT control signals and tracking error.
         self._pubs = BridgePublishers(self)
 
-        self._marker_sub = self.create_subscription(
-            PointStamped, Create.MARKER, self._marker_cb,
-            QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
-        )
-        self._takeoff_srv=None
-       # self._safe_to_fly = True
-       # self._takeoff_srv = self.create_service(
-       #             Takeoff, Create.SRV_TAKEOFF, self._takeoff_cb)
-        self._land_srv = self.create_service(
-            Land, Create.SRV_LAND, self._land_cb)
-        self._goto_srv = self.create_service(
-            GoTo, Create.SRV_GOTO, self._goto_cb)
+        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self._rigid_sub = None
+        self._marker_sub = None
+
+        if self._tracking_mode in (TrackingMode.RIGID_BODY, TrackingMode.AUTO):
+            self._rigid_sub = self.create_subscription(
+                PoseStamped,
+                Create.RIGID_BODY,
+                self._rigid_body_cb,
+                qos,
+            )
+        if self._tracking_mode in (TrackingMode.MARKER, TrackingMode.AUTO):
+            self._marker_sub = self.create_subscription(
+                PointStamped,
+                Create.MARKER,
+                self._marker_cb,
+                qos,
+            )
+
+        self._takeoff_srv = None
+        self._land_srv = self.create_service(Land, Create.SRV_LAND, self._land_cb)
+        self._goto_srv = self.create_service(GoTo, Create.SRV_GOTO, self._goto_cb)
         self._spiral_srv = self.create_service(
-            Spiral, Create.SRV_SPIRAL, self._spiral_cb)
-        self._kill_srv = self.create_service(
-            SetBool, Create.SRV_KILL, self._kill_cb)
+            Spiral, Create.SRV_SPIRAL, self._spiral_cb
+        )
+        self._kill_srv = self.create_service(SetBool, Create.SRV_KILL, self._kill_cb)
 
         cflib.crtp.init_drivers()
         self._connected = threading.Event()
         self._connect_failed = threading.Event()
         self._connect_error: str | None = None
 
-        self._cf = Crazyflie(rw_cache='./cache')
+        self._cf = Crazyflie(rw_cache="./cache")
         self._cf.fully_connected.add_callback(self._on_connected)
         self._cf.disconnected.add_callback(self._on_disconnected)
         self._cf.connection_failed.add_callback(self._on_connection_failed)
         self._cf.connection_lost.add_callback(self._on_connection_lost)
         self._cf.console.receivedChar.add_callback(self._on_console)
 
-        self.get_logger().info(f'Opening link to {self._uri}')
+        self.get_logger().info(f"Opening link to {self._uri}")
         self._cf.open_link(self._uri)
 
         timeout = float(
-            self.get_parameter(
-                'connection_timeout_s').get_parameter_value().double_value
+            self.get_parameter("connection_timeout_s")
+            .get_parameter_value()
+            .double_value
         )
         if not self._connected.wait(timeout=timeout):
             self._cf.close_link()
             raise RuntimeError(
-                f'Timed out connecting to {self._uri} after {timeout}s '
-                f'({self._connect_error or "no failure callback fired"})'
+                f"Timed out connecting to {self._uri} after {timeout}s "
+                f"({self._connect_error or 'no failure callback fired'})"
             )
             return
         self._safety_interval = self.create_timer(1, self._safety_check)
@@ -166,58 +224,101 @@ class CrazyBridge(Node):
         v = int(value)
         if v < 10:
             self.get_logger().warning(
-                f'{name}={v} ms is below cflib minimum 10 ms; clamping to 10 ms'
+                f"{name}={v} ms is below cflib minimum 10 ms; clamping to 10 ms"
             )
             v = 10
         if v % 10 != 0:
             adjusted = (v // 10) * 10 or 10
             self.get_logger().warning(
-                f'{name}={v} ms is not a multiple of 10; rounding to {adjusted} ms'
+                f"{name}={v} ms is not a multiple of 10; rounding to {adjusted} ms"
             )
             v = adjusted
         if v > 2540:
             self.get_logger().warning(
-                f'{name}={v} ms exceeds cflib max 2540 ms; clamping'
+                f"{name}={v} ms exceeds cflib max 2540 ms; clamping"
             )
             v = 2540
         return v
 
-    def _resolve_pid_conf_path(self) -> str:
-        path = self.get_parameter(
-            'pid_conf_path').get_parameter_value().string_value
-        if path:
-            return path
+    def _pid_path_for_mode(self, mode: str) -> str:
+        conf_file = "pid.conf" if mode == TrackingMode.MARKER else "pid_rigid_body.conf"
         return os.path.join(
-            get_package_share_directory('crazybridge'), 'config', 'pid.conf'
+            get_package_share_directory("crazybridge"), "config", conf_file
         )
 
+    def _resolve_pid_conf_path(self) -> str | None:
+        if self._explicit_pid_conf_path:
+            self.get_logger().info(f"Using explicitly configured PID path: {self._explicit_pid_conf_path}")
+            return self._explicit_pid_conf_path
+
+        mode = getattr(self, "_tracking_mode", TrackingMode.RIGID_BODY)
+        if mode == TrackingMode.AUTO:
+            self.get_logger().info(
+                "Tracking mode is 'auto': PID gains will be dynamically loaded once "
+                "the OptiTrack stream (marker vs rigid body) is detected."
+            )
+            return None
+
+        resolved = self._pid_path_for_mode(mode)
+        self.get_logger().info(
+            f"Auto-resolved default PID path for mode={mode!r}: {resolved}"
+        )
+        return resolved
+
     def _on_connected(self, link_uri: str) -> None:
-        self.get_logger().info(f'Connected to {link_uri}')
+        self.get_logger().info(f"Connected to {link_uri}")
         if self._load_pid_conf:
-            try:
-                self._apply_pid_conf(self._pid_conf_path)
-            except Exception as exc:
-                self.get_logger().error(
-                    f'Failed to load pid.conf from {self._pid_conf_path}: {exc}')  # noqa
+            if self._explicit_pid_conf_path:
+                try:
+                    self._apply_pid_conf(self._explicit_pid_conf_path)
+                    self._loaded_pid_source = "explicit"
+                except Exception as exc:
+                    self.get_logger().error(
+                        f"Failed to load PID conf from {self._explicit_pid_conf_path}: {exc}"
+                    )
+            elif self._tracking_mode != TrackingMode.AUTO and self._pid_conf_path:
+                try:
+                    self._apply_pid_conf(self._pid_conf_path)
+                    self._loaded_pid_source = self._tracking_mode
+                except Exception as exc:
+                    self.get_logger().error(
+                        f"Failed to load PID conf from {self._pid_conf_path}: {exc}"
+                    )
+            elif self._tracking_mode == TrackingMode.AUTO:
+                if self._active_source in (TrackingMode.RIGID_BODY, TrackingMode.MARKER):
+                    target_conf = self._pid_path_for_mode(self._active_source)
+                    self._pid_conf_path = target_conf
+                    self._loaded_pid_source = self._active_source
+                    self.get_logger().info(
+                        f"[AUTO MODE] Radio connected, active source already detected: {self._active_source.upper()}. "
+                        f"Loading PID gains from: {target_conf}"
+                    )
+                    try:
+                        self._apply_pid_conf(target_conf)
+                    except Exception as exc:
+                        self.get_logger().error(f"Failed to load PID conf: {exc}")
+                else:
+                    self.get_logger().info(
+                        "[AUTO MODE] Radio connected. Waiting to detect OptiTrack source "
+                        "(marker vs rigid body) before applying PID gains..."
+                    )
         try:
             self._cf.param.set_value(PARAM_HL_COMMANDER, 1)
-#            self._cf.param.set_value(PARAM_CONTROLLER, 5) # Add constats for the controller oot = 5 and auto = 0
+            #            self._cf.param.set_value(PARAM_CONTROLLER, 5) # Add constats for the controller oot = 5 and auto = 0
             self._cf.param.set_value(PARAM_ESTIMATOR, ESTIMATOR_KALMAN)
         except Exception as exc:
-            self.get_logger().error(f'Failed to set startup params: {exc}')
+            self.get_logger().error(f"Failed to set startup params: {exc}")
 
-        self._pos_log = LogConfig(
-            name='kalman_pos', period_in_ms=self._log_period_ms)
-        self._pos_log.add_variable('kalman.stateX', 'float')
-        self._pos_log.add_variable('kalman.stateY', 'float')
-        self._pos_log.add_variable('kalman.stateZ', 'float')
+        self._pos_log = LogConfig(name="kalman_pos", period_in_ms=self._log_period_ms)
+        self._pos_log.add_variable("kalman.stateX", "float")
+        self._pos_log.add_variable("kalman.stateY", "float")
+        self._pos_log.add_variable("kalman.stateZ", "float")
 
-        self._q_log = LogConfig(
-            name='kalman_q', period_in_ms=self._log_period_ms)
-        self._q_log.add_variable('kalman.q0', 'float')
-        self._q_log.add_variable('kalman.q1', 'float')
-        self._q_log.add_variable('kalman.q2', 'float')
-        self._q_log.add_variable('kalman.q3', 'float')
+        self._q_log = LogConfig(name="kalman_q", period_in_ms=self._log_period_ms)
+        self._q_log.add_variable("kalman.q0", "float")
+        self._q_log.add_variable("kalman.q1", "float")
+        self._q_log.add_variable("kalman.q2", "float")
+        self._q_log.add_variable("kalman.q3", "float")
 
         extra_period = self._sanitise_log_period(500, "extra_log_ms")
         self._pm_log = LogConfig(name="battery", period_in_ms=extra_period)
@@ -229,10 +330,11 @@ class CrazyBridge(Node):
         # or gain set is active -- ideal as the reference to compare the flown
         # path against.
         self._setpoint_log = LogConfig(
-            name='ctrltarget', period_in_ms=self._log_period_ms)
-        self._setpoint_log.add_variable('ctrltarget.x', 'float')
-        self._setpoint_log.add_variable('ctrltarget.y', 'float')
-        self._setpoint_log.add_variable('ctrltarget.z', 'float')
+            name="ctrltarget", period_in_ms=self._log_period_ms
+        )
+        self._setpoint_log.add_variable("ctrltarget.x", "float")
+        self._setpoint_log.add_variable("ctrltarget.y", "float")
+        self._setpoint_log.add_variable("ctrltarget.z", "float")
 
         try:
             self._cf.log.add_config(self._pos_log)
@@ -242,14 +344,13 @@ class CrazyBridge(Node):
             self._pos_log.data_received_cb.add_callback(self._on_pos_log)
             self._q_log.data_received_cb.add_callback(self._on_q_log)
             self._pm_log.data_received_cb.add_callback(self._on_pm_log)
-            self._setpoint_log.data_received_cb.add_callback(
-                self._on_setpoint_log)
+            self._setpoint_log.data_received_cb.add_callback(self._on_setpoint_log)
             self._pos_log.start()
             self._q_log.start()
             self._pm_log.start()
             self._setpoint_log.start()
         except Exception as exc:
-            self.get_logger().error(f'Failed to register log blocks: {exc}')
+            self.get_logger().error(f"Failed to register log blocks: {exc}")
 
         self._setup_oot_logs()
 
@@ -257,34 +358,33 @@ class CrazyBridge(Node):
 
     def _setup_oot_logs(self) -> None:
         period = self._oot_log_period_ms
-        self._input_log = LogConfig(name='input', period_in_ms=period)
-        self._input_log.add_variable('oot.thrust', 'float')
-        self._input_log.add_variable('oot.torque_x', 'float')
-        self._input_log.add_variable('oot.torque_y', 'float')
-        self._input_log.add_variable('oot.torque_z', 'float')
+        self._input_log = LogConfig(name="input", period_in_ms=period)
+        self._input_log.add_variable("oot.thrust", "float")
+        self._input_log.add_variable("oot.torque_x", "float")
+        self._input_log.add_variable("oot.torque_y", "float")
+        self._input_log.add_variable("oot.torque_z", "float")
 
-        self._pos_err_log = LogConfig(name='oot_pos_err', period_in_ms=period)
-        self._pos_err_log.add_variable('oot.pos_err_x', 'float')
-        self._pos_err_log.add_variable('oot.pos_err_y', 'float')
-        self._pos_err_log.add_variable('oot.pos_err_z', 'float')
+        self._pos_err_log = LogConfig(name="oot_pos_err", period_in_ms=period)
+        self._pos_err_log.add_variable("oot.pos_err_x", "float")
+        self._pos_err_log.add_variable("oot.pos_err_y", "float")
+        self._pos_err_log.add_variable("oot.pos_err_z", "float")
 
-        self._q_err_log = LogConfig(name='oot_q_err', period_in_ms=period)
-        self._q_err_log.add_variable('oot.q_err_x', 'float')
-        self._q_err_log.add_variable('oot.q_err_y', 'float')
-        self._q_err_log.add_variable('oot.q_err_z', 'float')
-        self._q_err_log.add_variable('oot.q_err_w', 'float')
+        self._q_err_log = LogConfig(name="oot_q_err", period_in_ms=period)
+        self._q_err_log.add_variable("oot.q_err_x", "float")
+        self._q_err_log.add_variable("oot.q_err_y", "float")
+        self._q_err_log.add_variable("oot.q_err_z", "float")
+        self._q_err_log.add_variable("oot.q_err_w", "float")
 
-        self._qd_log = LogConfig(name='oot_qd', period_in_ms=period)
-        self._qd_log.add_variable('oot.qd_x', 'float')
-        self._qd_log.add_variable('oot.qd_y', 'float')
-        self._qd_log.add_variable('oot.qd_z', 'float')
-        self._qd_log.add_variable('oot.qd_w', 'float')
+        self._qd_log = LogConfig(name="oot_qd", period_in_ms=period)
+        self._qd_log.add_variable("oot.qd_x", "float")
+        self._qd_log.add_variable("oot.qd_y", "float")
+        self._qd_log.add_variable("oot.qd_z", "float")
+        self._qd_log.add_variable("oot.qd_w", "float")
 
-        self._ang_vel_err_log = LogConfig(
-            name='oot_ang_vel_err', period_in_ms=period)
-        self._ang_vel_err_log.add_variable('oot.ang_vel_err_x', 'float')
-        self._ang_vel_err_log.add_variable('oot.ang_vel_err_y', 'float')
-        self._ang_vel_err_log.add_variable('oot.ang_vel_err_z', 'float')
+        self._ang_vel_err_log = LogConfig(name="oot_ang_vel_err", period_in_ms=period)
+        self._ang_vel_err_log.add_variable("oot.ang_vel_err_x", "float")
+        self._ang_vel_err_log.add_variable("oot.ang_vel_err_y", "float")
+        self._ang_vel_err_log.add_variable("oot.ang_vel_err_z", "float")
 
         try:
             self._cf.log.add_config(self._input_log)
@@ -293,10 +393,8 @@ class CrazyBridge(Node):
             self._cf.log.add_config(self._qd_log)
             self._cf.log.add_config(self._ang_vel_err_log)
 
-            self._input_log.data_received_cb.add_callback(
-                self._on_input_log)
-            self._pos_err_log.data_received_cb.add_callback(
-                self._on_pos_err_log)
+            self._input_log.data_received_cb.add_callback(self._on_input_log)
+            self._pos_err_log.data_received_cb.add_callback(self._on_pos_err_log)
             self._q_err_log.data_received_cb.add_callback(self._on_q_err_log)
             self._qd_log.data_received_cb.add_callback(self._on_qd_log)
             self._ang_vel_err_log.data_received_cb.add_callback(
@@ -308,10 +406,9 @@ class CrazyBridge(Node):
             self._q_err_log.start()
             self._qd_log.start()
             self._ang_vel_err_log.start()
-            self.get_logger().info('OOT log blocks started')
+            self.get_logger().info("OOT log blocks started")
         except Exception as exc:
-            self.get_logger().error(
-                f'Failed to register OOT log blocks: {exc}')
+            self.get_logger().error(f"Failed to register OOT log blocks: {exc}")
 
     def _on_pm_log(self, _timestamp, data, _logconf):
         batt_msg = Float32()
@@ -322,9 +419,9 @@ class CrazyBridge(Node):
         msg = PointStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self._odom_frame
-        msg.point.x = float(data['ctrltarget.x'])
-        msg.point.y = float(data['ctrltarget.y'])
-        msg.point.z = float(data['ctrltarget.z'])
+        msg.point.x = float(data["ctrltarget.x"])
+        msg.point.y = float(data["ctrltarget.y"])
+        msg.point.z = float(data["ctrltarget.z"])
         self._pubs.setpoint.publish(msg)
 
     def _on_input_log(self, _timestamp, data, _logconf):
@@ -343,37 +440,123 @@ class CrazyBridge(Node):
         # bridge and controller_test cannot disagree about what a run flew with.
         conf = PidConf.load(path)
 
-        self.get_logger().info(f'Loading PID gains from {path}')
+        self.get_logger().info(f"Loading PID gains from {path}")
         for line in conf.describe():
             self.get_logger().info(line)
 
         for name, value in conf.params():
             self._cf.param.set_value(name, value)
 
-        self.get_logger().info('Done configuring PID')
+        self.get_logger().info("Done configuring PID")
 
     def _on_disconnected(self, link_uri: str) -> None:
-        self.get_logger().info(f'Disconnected from {link_uri}')
+        self.get_logger().info(f"Disconnected from {link_uri}")
+
+    def _rigid_body_cb(self, msg: PoseStamped) -> None:
+        header: Header = msg.header
+        if self._rigid_body_id is None:
+            self._rigid_body_id = header.frame_id
+            self.get_logger().info(f"Locked onto rigid body frame: {self._rigid_body_id!r}")
+        if self._rigid_body_id != header.frame_id:
+            return
+
+        pos: Point = msg.pose.position
+        orie: Quaternion = msg.pose.orientation
+
+        axis = [pos.x, pos.y, pos.z]
+        if any(abs(i) > self._max_distance_from_origin for i in axis):
+            self.get_logger().warning(
+                f"Rigid body position [{pos.x:.2f}, {pos.y:.2f}, {pos.z:.2f}] "
+                f"exceeds limit {self._max_distance_from_origin}m",
+                throttle_duration_sec=1.0,
+            )
+            self._bad_mocap_counter += 1
+            return
+
+        now = time()
+        self._last_seen_rigid_body = now
+        self._last_seen_mocap = now
+        self._mocap_locked = True
+        self._active_source = TrackingMode.RIGID_BODY
+        self._bad_mocap_counter = max(0, self._bad_mocap_counter - 1)
+
+        # In AUTO mode without an explicit user PID file, apply rigid body gains if not yet applied
+        if (
+            self._tracking_mode == TrackingMode.AUTO
+            and not self._explicit_pid_conf_path
+            and self._loaded_pid_source != TrackingMode.RIGID_BODY
+        ):
+            target_conf = self._pid_path_for_mode(TrackingMode.RIGID_BODY)
+            self._pid_conf_path = target_conf
+            self._loaded_pid_source = TrackingMode.RIGID_BODY
+            self.get_logger().info(
+                f"[AUTO MODE] Detected active source: RIGID_BODY (6-DoF). "
+                f"Loading PID gains from: {target_conf}"
+            )
+            if self._cf.is_connected() and self._load_pid_conf:
+                try:
+                    self._apply_pid_conf(target_conf)
+                except Exception as exc:
+                    self.get_logger().error(f"Failed to apply auto-detected PID conf: {exc}")
+
+        if self._cf.is_connected():
+            self._cf.extpos.send_extpose(
+                pos.x, pos.y, pos.z, orie.x, orie.y, orie.z, orie.w
+            )
 
     def _marker_cb(self, msg: PointStamped) -> None:
         header: Header = msg.header
         if self._marker_id is None:
             self._marker_id = header.frame_id
+            self.get_logger().info(f"Locked onto marker frame: {self._marker_id!r}")
         if self._marker_id != header.frame_id:
             return
-        point: Point = msg.point
-        axis = [point.x, point.y, point.z]
-        over_limit = [abs(i) > self._max_distance_from_origin for i in axis]
-        if any(over_limit):
-            print(over_limit)
-            self._bad_marker_counter += 1
-            return
-        self._last_seen_marker = time()
-        self._bad_marker_counter = self._bad_marker_counter -1 if self._bad_marker_counter > 0 else 0
-        if self._cf.connected:
-            self._cf.extpos.send_extpos(point.x, point.y, point.z)
 
-    def _safety_check(self):
+        now = time()
+        # In AUTO mode, if rigid-body frames are active (seen within the last 1.0s), prioritize rigid-body
+        if self._tracking_mode == TrackingMode.AUTO and (now - self._last_seen_rigid_body) < 1.0:
+            return
+
+        pt: Point = msg.point
+        axis = [pt.x, pt.y, pt.z]
+        if any(abs(i) > self._max_distance_from_origin for i in axis):
+            self.get_logger().warning(
+                f"Marker position [{pt.x:.2f}, {pt.y:.2f}, {pt.z:.2f}] "
+                f"exceeds limit {self._max_distance_from_origin}m",
+                throttle_duration_sec=1.0,
+            )
+            self._bad_mocap_counter += 1
+            return
+
+        self._last_seen_marker = now
+        self._last_seen_mocap = now
+        self._mocap_locked = True
+        self._active_source = TrackingMode.MARKER
+        self._bad_mocap_counter = max(0, self._bad_mocap_counter - 1)
+
+        # In AUTO mode without an explicit user PID file, apply single-ball marker gains if not yet applied
+        if (
+            self._tracking_mode == TrackingMode.AUTO
+            and not self._explicit_pid_conf_path
+            and self._loaded_pid_source != TrackingMode.MARKER
+        ):
+            target_conf = self._pid_path_for_mode(TrackingMode.MARKER)
+            self._pid_conf_path = target_conf
+            self._loaded_pid_source = TrackingMode.MARKER
+            self.get_logger().info(
+                f"[AUTO MODE] Detected active source: MARKER (single-ball 3-DoF). "
+                f"Loading PID gains from: {target_conf}"
+            )
+            if self._cf.is_connected() and self._load_pid_conf:
+                try:
+                    self._apply_pid_conf(target_conf)
+                except Exception as exc:
+                    self.get_logger().error(f"Failed to apply auto-detected PID conf: {exc}")
+
+        if self._cf.is_connected():
+            self._cf.extpos.send_extpos(pt.x, pt.y, pt.z)
+
+    def _safety_check(self) -> None:
         if not self._cf.is_connected():
             self.get_logger().error("Disconnected from crazyflie. Trying to reconnect")
             with self._safe_to_fly_lock:
@@ -385,12 +568,16 @@ class CrazyBridge(Node):
                         sleep(5)
                     self._cf.supervisor.send_emergency_stop()
 
-        if self._marker_id is None: 
+        if not self._mocap_locked:
             return
-        time_diff = time() - self._last_seen_marker
-        if time_diff > 2 or self._bad_marker_counter > 10:
+
+        time_diff = time() - self._last_seen_mocap
+        if time_diff > 2.0 or self._bad_mocap_counter > 10:
             with self._safe_to_fly_lock:
-                self.get_logger().error(f"Bad marker detected. Not seen for {time_diff} and had {self._bad_marker_counter} infractions")
+                self.get_logger().error(
+                    f"Bad mocap ({self._active_source}) detected. Not seen for {time_diff:.2f}s "
+                    f"and had {self._bad_mocap_counter} infractions"
+                )
                 if self._safe_to_fly:
                     self._safe_to_fly = False
                     self.get_logger().error("LANDING!!")
@@ -398,37 +585,39 @@ class CrazyBridge(Node):
                     sleep(5)
                     self._cf.supervisor.send_emergency_stop()
             return
+
         with self._safe_to_fly_lock:
             if not self._takeoff_srv:
                 self._takeoff_srv = self.create_service(
-                    Takeoff, Create.SRV_TAKEOFF, self._takeoff_cb)
+                    Takeoff, Create.SRV_TAKEOFF, self._takeoff_cb
+                )
             self._safe_to_fly = True
 
     def _on_connection_failed(self, link_uri: str, msg: str) -> None:
         self._connect_error = msg
-        self.get_logger().error(f'Connection to {link_uri} failed: {msg}')
+        self.get_logger().error(f"Connection to {link_uri} failed: {msg}")
         self._connect_failed.set()
         self._connected.set()
 
     def _on_connection_lost(self, link_uri: str, msg: str) -> None:
-        self.get_logger().warning(f'Connection to {link_uri} lost: {msg}')
+        self.get_logger().warning(f"Connection to {link_uri} lost: {msg}")
 
     def _on_pos_log(self, _timestamp, data, _logconf) -> None:
         with self._pos_lock:
             self._pos = [
-                float(data['kalman.stateX']),
-                float(data['kalman.stateY']),
-                float(data['kalman.stateZ']),
+                float(data["kalman.stateX"]),
+                float(data["kalman.stateY"]),
+                float(data["kalman.stateZ"]),
             ]
         self._publish_odom()
 
     def _on_q_log(self, _timestamp, data, _logconf) -> None:
         # Bitcraze kalman logs (q0, q1, q2, q3) as (w, x, y, z).
         x, y, z, w = self._normalize_quat(
-            float(data['kalman.q1']),
-            float(data['kalman.q2']),
-            float(data['kalman.q3']),
-            float(data['kalman.q0']),
+            float(data["kalman.q1"]),
+            float(data["kalman.q2"]),
+            float(data["kalman.q3"]),
+            float(data["kalman.q0"]),
         )
         with self._pos_lock:
             self._quat = [x, y, z, w]
@@ -436,9 +625,9 @@ class CrazyBridge(Node):
 
     def _on_pos_err_log(self, _timestamp, data, _logconf) -> None:
         v = (
-            float(data['oot.pos_err_x']),
-            float(data['oot.pos_err_y']),
-            float(data['oot.pos_err_z']),
+            float(data["oot.pos_err_x"]),
+            float(data["oot.pos_err_y"]),
+            float(data["oot.pos_err_z"]),
         )
         with self._oot_lock:
             self._oot_pos_err = v
@@ -451,10 +640,10 @@ class CrazyBridge(Node):
 
     def _on_q_err_log(self, _timestamp, data, _logconf) -> None:
         v = self._normalize_quat(
-            float(data['oot.q_err_x']),
-            float(data['oot.q_err_y']),
-            float(data['oot.q_err_z']),
-            float(data['oot.q_err_w']),
+            float(data["oot.q_err_x"]),
+            float(data["oot.q_err_y"]),
+            float(data["oot.q_err_z"]),
+            float(data["oot.q_err_w"]),
         )
         with self._oot_lock:
             self._oot_q_err = v
@@ -467,10 +656,10 @@ class CrazyBridge(Node):
 
     def _on_qd_log(self, _timestamp, data, _logconf) -> None:
         v = self._normalize_quat(
-            float(data['oot.qd_x']),
-            float(data['oot.qd_y']),
-            float(data['oot.qd_z']),
-            float(data['oot.qd_w']),
+            float(data["oot.qd_x"]),
+            float(data["oot.qd_y"]),
+            float(data["oot.qd_z"]),
+            float(data["oot.qd_w"]),
         )
         with self._oot_lock:
             self._oot_qd = v
@@ -483,9 +672,9 @@ class CrazyBridge(Node):
 
     def _on_ang_vel_err_log(self, _timestamp, data, _logconf) -> None:
         v = (
-            float(data['oot.ang_vel_err_x']),
-            float(data['oot.ang_vel_err_y']),
-            float(data['oot.ang_vel_err_z']),
+            float(data["oot.ang_vel_err_x"]),
+            float(data["oot.ang_vel_err_y"]),
+            float(data["oot.ang_vel_err_z"]),
         )
 
     def _publish_odom(self) -> None:
@@ -506,7 +695,9 @@ class CrazyBridge(Node):
         self._pubs.odom.publish(msg)
 
     @staticmethod
-    def _normalize_quat(x: float, y: float, z: float, w: float) -> tuple[float, float, float, float]:
+    def _normalize_quat(
+        x: float, y: float, z: float, w: float
+    ) -> tuple[float, float, float, float]:
         """Return (x, y, z, w) as a unit quaternion.
 
         The Crazyflie estimator occasionally emits quaternions that are not
@@ -529,26 +720,23 @@ class CrazyBridge(Node):
         if not self._safe_to_fly:
             # Must still answer, or rclpy raises TypeError on send_response and
             # tears down the spin loop (killing the link).
-            self.get_logger().warning('takeoff refused: not safe to fly')
+            self.get_logger().warning("takeoff refused: not safe to fly")
             response.success = False
-            response.message = 'not safe to fly'
+            response.message = "not safe to fly"
             return response
         duration = self._duration_to_seconds(request.duration)
         self.get_logger().info(
-            f'takeoff height={request.height:.2f}m duration={duration:.2f}s '
-            f'group_mask={request.group_mask}'
+            f"takeoff height={request.height:.2f}m duration={duration:.2f}s "
+            f"group_mask={request.group_mask}"
         )
         try:
-            self._cf.high_level_commander.takeoff(
-                float(request.height),
-                duration
-            )
-#            sleep(duration * 0.75)
-#            self._cf.high_level_commander.go_to(1, 1, 2, 0, 3)
+            self._cf.high_level_commander.takeoff(float(request.height), duration)
+            #            sleep(duration * 0.75)
+            #            self._cf.high_level_commander.go_to(1, 1, 2, 0, 3)
             response.success = True
-            response.message = ''
+            response.message = ""
         except Exception as exc:
-            self.get_logger().error(f'takeoff failed: {exc}')
+            self.get_logger().error(f"takeoff failed: {exc}")
             response.success = False
             response.message = str(exc)
         return response
@@ -558,28 +746,24 @@ class CrazyBridge(Node):
     ) -> Land.Response:
         if not request.data:
             response.success = False
-            response.message = 'kill not requested (data=false)'
+            response.message = "kill not requested (data=false)"
             return response
-        self.get_logger().info(
-            f'Kill!'
-        )
+        self.get_logger().info("Kill!")
         try:
             self._cf.supervisor.send_emergency_stop()
             response.success = True
-            response.message = ''
+            response.message = ""
         except Exception as exc:
-            self.get_logger().error(f'Kill failed: {exc}')
+            self.get_logger().error(f"Kill failed: {exc}")
             response.success = False
             response.message = str(exc)
         return response
 
-    def _land_cb(
-        self, request: Land.Request, response: Land.Response
-    ) -> Land.Response:
+    def _land_cb(self, request: Land.Request, response: Land.Response) -> Land.Response:
         duration = self._duration_to_seconds(request.duration)
         self.get_logger().info(
-            f'land height={request.height:.2f}m duration={duration:.2f}s '
-            f'group_mask={request.group_mask}'
+            f"land height={request.height:.2f}m duration={duration:.2f}s "
+            f"group_mask={request.group_mask}"
         )
         try:
             self._cf.high_level_commander.land(
@@ -588,25 +772,23 @@ class CrazyBridge(Node):
                 group_mask=int(request.group_mask),
             )
             response.success = True
-            response.message = ''
+            response.message = ""
         except Exception as exc:
-            self.get_logger().error(f'land failed: {exc}')
+            self.get_logger().error(f"land failed: {exc}")
             response.success = False
             response.message = str(exc)
         return response
 
-    def _goto_cb(
-        self, request: GoTo.Request, response: GoTo.Response
-    ) -> GoTo.Response:
+    def _goto_cb(self, request: GoTo.Request, response: GoTo.Response) -> GoTo.Response:
         duration = self._duration_to_seconds(request.duration)
         # crazybridge_interfaces specifies yaw in degrees, matching
         # crazyswarm2; cflib's high_level_commander.go_to expects radians.
         yaw_rad = math.radians(float(request.yaw))
         self.get_logger().info(
-            f'go_to x={request.goal.x:.2f} y={request.goal.y:.2f} '
-            f'z={request.goal.z:.2f} yaw={request.yaw:.2f}deg '
-            f'duration={duration:.2f}s relative={request.relative} '
-            f'group_mask={request.group_mask}'
+            f"go_to x={request.goal.x:.2f} y={request.goal.y:.2f} "
+            f"z={request.goal.z:.2f} yaw={request.yaw:.2f}deg "
+            f"duration={duration:.2f}s relative={request.relative} "
+            f"group_mask={request.group_mask}"
         )
         try:
             self._cf.high_level_commander.go_to(
@@ -619,9 +801,9 @@ class CrazyBridge(Node):
                 group_mask=int(request.group_mask),
             )
             response.success = True
-            response.message = ''
+            response.message = ""
         except Exception as exc:
-            self.get_logger().error(f'go_to failed: {exc}')
+            self.get_logger().error(f"go_to failed: {exc}")
             response.success = False
             response.message = str(exc)
         return response
@@ -634,10 +816,10 @@ class CrazyBridge(Node):
         # cflib's high_level_commander.spiral expects radians.
         angle_rad = math.radians(float(request.angle))
         self.get_logger().info(
-            f'spiral angle={request.angle:.2f}deg r0={request.r0:.2f} '
-            f'rf={request.rf:.2f} ascent={request.ascent:.2f} '
-            f'duration={duration:.2f}s sideways={request.sideways} '
-            f'clockwise={request.clockwise} group_mask={request.group_mask}'
+            f"spiral angle={request.angle:.2f}deg r0={request.r0:.2f} "
+            f"rf={request.rf:.2f} ascent={request.ascent:.2f} "
+            f"duration={duration:.2f}s sideways={request.sideways} "
+            f"clockwise={request.clockwise} group_mask={request.group_mask}"
         )
         try:
             self._cf.high_level_commander.spiral(
@@ -651,17 +833,22 @@ class CrazyBridge(Node):
                 group_mask=int(request.group_mask),
             )
             response.success = True
-            response.message = ''
+            response.message = ""
         except Exception as exc:
-            self.get_logger().error(f'spiral failed: {exc}')
+            self.get_logger().error(f"spiral failed: {exc}")
             response.success = False
             response.message = str(exc)
         return response
 
     def shutdown(self) -> None:
         for name in (
-            '_pos_log', '_q_log', '_setpoint_log',
-            '_pos_err_log', '_q_err_log', '_qd_log', '_ang_vel_err_log',
+            "_pos_log",
+            "_q_log",
+            "_setpoint_log",
+            "_pos_err_log",
+            "_q_err_log",
+            "_qd_log",
+            "_ang_vel_err_log",
         ):
             log = getattr(self, name, None)
             if log is None:
@@ -687,5 +874,5 @@ def main(args=None) -> None:
             rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
