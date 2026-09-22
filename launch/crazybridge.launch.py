@@ -9,8 +9,10 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description() -> LaunchDescription:
-    default_pid_conf = os.path.join(
-        get_package_share_directory('crazybridge'), 'config', 'pid.conf'
+    tracking_mode_arg = DeclareLaunchArgument(
+        'tracking_mode',
+        default_value='rigid_body',
+        description="Mocap tracking mode: 'rigid_body' (6-DoF), 'marker' (single-ball 3-DoF), or 'auto'.",
     )
 
     uri_arg = DeclareLaunchArgument(
@@ -33,8 +35,11 @@ def generate_launch_description() -> LaunchDescription:
     )
     pid_conf_arg = DeclareLaunchArgument(
         'pid_conf_path',
-        default_value=default_pid_conf,
-        description='Path to pid.conf with OOT controller gains.',
+        default_value='',
+        description=(
+            'Path to pid.conf with OOT controller gains. If empty, auto-resolves '
+            'to pid_rigid_body.conf or pid.conf based on tracking_mode.'
+        ),
     )
     load_pid_conf_arg = DeclareLaunchArgument(
         'load_pid_conf',
@@ -70,6 +75,7 @@ def generate_launch_description() -> LaunchDescription:
     )
 
     return LaunchDescription([
+        tracking_mode_arg,
         uri_arg,
         log_period_arg,
         oot_log_period_arg,
@@ -86,6 +92,7 @@ def generate_launch_description() -> LaunchDescription:
             output='screen',
             parameters=[{
                 'uri': LaunchConfiguration('uri'),
+                'tracking_mode': LaunchConfiguration('tracking_mode'),
                 'log_period_ms': LaunchConfiguration('log_period_ms'),
                 'oot_log_period_ms': LaunchConfiguration('oot_log_period_ms'),
                 'pid_conf_path': LaunchConfiguration('pid_conf_path'),

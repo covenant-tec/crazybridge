@@ -35,18 +35,17 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description() -> LaunchDescription:
-    default_pid_conf = os.path.join(
-        get_package_share_directory('crazybridge'), 'config', 'pid.conf'
-    )
-
     args = [
         DeclareLaunchArgument(
             'config_name', default_value='default',
             description='Label for this run; names the output folder and the '
                         'rerun recording.'),
         DeclareLaunchArgument(
-            'pid_conf_path', default_value=default_pid_conf,
-            description='OOT gain file to load for this run.'),
+            'tracking_mode', default_value='rigid_body',
+            description="Mocap tracking mode: 'rigid_body' (6-DoF), 'marker' (single-ball 3-DoF), or 'auto'."),
+        DeclareLaunchArgument(
+            'pid_conf_path', default_value='',
+            description='OOT gain file to load for this run (empty = auto-resolve based on tracking_mode).'),
         DeclareLaunchArgument(
             'output_dir', default_value='/tmp/ctrl_test',
             description='Parent directory; this run writes into '
@@ -87,6 +86,7 @@ def generate_launch_description() -> LaunchDescription:
         output='screen',
         parameters=[{
             'uri': LaunchConfiguration('uri'),
+            'tracking_mode': LaunchConfiguration('tracking_mode'),
             'pid_conf_path': LaunchConfiguration('pid_conf_path'),
             'load_pid_conf': True,
         }],

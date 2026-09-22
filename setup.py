@@ -11,7 +11,7 @@ setup(
          ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', ['launch/crazybridge.launch.py', 'launch/crazyoptitrack.launch.py', 'launch/controller_test.launch.py']),
-        ('share/' + package_name + '/config', ['config/pid.conf']),
+        ('share/' + package_name + '/config', ['config/pid.conf', 'config/pid_rigid_body.conf']),
     ],
     install_requires=['setuptools', 'cflib', 'textual', 'rerun-sdk', 'numpy'],
     zip_safe=True,

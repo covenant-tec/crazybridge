@@ -9,41 +9,45 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description() -> LaunchDescription:
-    default_pid_conf = os.path.join(
-        get_package_share_directory('crazybridge'), 'config', 'pid.conf'
+    tracking_mode_arg = DeclareLaunchArgument(
+        "tracking_mode",
+        default_value="rigid_body",
+        description="Mocap tracking mode: 'rigid_body' (6-DoF), 'marker' (single-ball 3-DoF), or 'auto'.",
     )
-
     uri_arg = DeclareLaunchArgument(
-        'uri',
-        default_value='radio://0/80/2M/E7E7E7E702',
-        description='cflib URI for the Crazyflie (default targets CrazySim SITL).',
+        "uri",
+        default_value="radio://0/80/2M/E7E7E7E7E7",
+        description="cflib URI for the Crazyflie (default targets CrazySim SITL).",
     )
     log_period_arg = DeclareLaunchArgument(
-        'log_period_ms',
-        default_value='50',
+        "log_period_ms",
+        default_value="50",
         description=(
-            'Period in ms for the Kalman state log blocks. cflib quantises '
-            'this to 10 ms ticks, so values must be a multiple of 10 and >= 10.'
+            "Period in ms for the Kalman state log blocks. cflib quantises "
+            "this to 10 ms ticks, so values must be a multiple of 10 and >= 10."
         ),
     )
     oot_log_period_arg = DeclareLaunchArgument(
-        'oot_log_period_ms',
-        default_value='100',
-        description='Period in ms for the OOT debug log blocks.',
+        "oot_log_period_ms",
+        default_value="100",
+        description="Period in ms for the OOT debug log blocks.",
     )
     pid_conf_arg = DeclareLaunchArgument(
-        'pid_conf_path',
-        default_value=default_pid_conf,
-        description='Path to pid.conf with OOT controller gains.',
+        "pid_conf_path",
+        default_value="",
+        description=(
+            "Path to pid.conf with OOT controller gains. If empty, auto-resolves "
+            "to pid_rigid_body.conf or pid.conf based on tracking_mode."
+        ),
     )
     load_pid_conf_arg = DeclareLaunchArgument(
-        'load_pid_conf',
-        default_value='true',
-        description='Whether to push pid.conf values to ootParams on connect.',
+        "load_pid_conf",
+        default_value="true",
+        description="Whether to push pid.conf values to ootParams on connect.",
     )
     rerun_mode_arg = DeclareLaunchArgument(
-        'rerun_mode',
-        default_value='connect',
+        "rerun_mode",
+        default_value="spawn",
         description=(
             "How to attach to rerun: 'spawn' (launches a viewer), "
             "'connect' (attach to running viewer at rerun_addr), "
@@ -51,62 +55,70 @@ def generate_launch_description() -> LaunchDescription:
         ),
     )
     rerun_addr_arg = DeclareLaunchArgument(
-        'rerun_addr',
-        default_value='rerun+http://10.242.79.176:9876/proxy',
-        description='gRPC address for rerun_mode=connect (empty = default).',
+        "rerun_addr",
+        default_value="rerun+http://10.242.79.176:9876/proxy",
+        description="gRPC address for rerun_mode=connect (empty = default).",
     )
     rerun_save_path_arg = DeclareLaunchArgument(
-        'rerun_save_path',
-        default_value='',
-        description='Output .rrd path for rerun_mode=save.',
+        "rerun_save_path",
+        default_value="",
+        description="Output .rrd path for rerun_mode=save.",
     )
     rerun_oot_decimate_arg = DeclareLaunchArgument(
-        'rerun_oot_decimate',
-        default_value='2',
+        "rerun_oot_decimate",
+        default_value="2",
         description=(
-            'Keep every Nth OOT sample when streaming to rerun. Raise this '
-            'if you see re_quota_channel back-pressure warnings.'
+            "Keep every Nth OOT sample when streaming to rerun. Raise this "
+            "if you see re_quota_channel back-pressure warnings."
         ),
     )
 
-    return LaunchDescription([
-        uri_arg,
-        log_period_arg,
-        oot_log_period_arg,
-        pid_conf_arg,
-        load_pid_conf_arg,
-        rerun_mode_arg,
-        rerun_addr_arg,
-        rerun_save_path_arg,
-        rerun_oot_decimate_arg,
-        Node(
-            package='crazybridge',
-            executable='crazybridge',
-            name='crazybridge',
-            output='screen',
-            parameters=[{
-                'uri': LaunchConfiguration('uri'),
-                'log_period_ms': LaunchConfiguration('log_period_ms'),
-                'oot_log_period_ms': LaunchConfiguration('oot_log_period_ms'),
-                'pid_conf_path': LaunchConfiguration('pid_conf_path'),
-                'load_pid_conf': LaunchConfiguration('load_pid_conf'),
-            }],
-        ),
-        Node(
-            package='crazybridge',
-            executable='rerun',
-            name='rerun',
-            output='screen',
-            parameters=[{
-                'rerun_mode': LaunchConfiguration('rerun_mode'),
-                'rerun_addr': LaunchConfiguration('rerun_addr'),
-                'rerun_save_path': LaunchConfiguration('rerun_save_path'),
-            }]
-        ),
-        Node(
-            package='optitrack_client',
-            executable='optitrack_client',
-            name='optitrack',
-            output='screen',
-        )
-    ])
+    return LaunchDescription(
+        [
+            tracking_mode_arg,
+            uri_arg,
+            log_period_arg,
+            oot_log_period_arg,
+            pid_conf_arg,
+            load_pid_conf_arg,
+            rerun_mode_arg,
+            rerun_addr_arg,
+            rerun_save_path_arg,
+            rerun_oot_decimate_arg,
+            Node(
+                package="crazybridge",
+                executable="crazybridge",
+                name="crazybridge",
+                output="screen",
+                parameters=[
+                    {
+                        "uri": LaunchConfiguration("uri"),
+                        "tracking_mode": LaunchConfiguration("tracking_mode"),
+                        "log_period_ms": LaunchConfiguration("log_period_ms"),
+                        "oot_log_period_ms": LaunchConfiguration("oot_log_period_ms"),
+                        "pid_conf_path": LaunchConfiguration("pid_conf_path"),
+                        "load_pid_conf": LaunchConfiguration("load_pid_conf"),
+                    }
+                ],
+            ),
+            Node(
+                package="crazybridge",
+                executable="rerun",
+                name="rerun",
+                output="screen",
+                parameters=[
+                    {
+                        "rerun_mode": LaunchConfiguration("rerun_mode"),
+                        "rerun_addr": LaunchConfiguration("rerun_addr"),
+                        "rerun_save_path": LaunchConfiguration("rerun_save_path"),
+                    }
+                ],
+            ),
+            Node(
+                package="optitrack_client",
+                executable="optitrack_client",
+                name="optitrack",
+                output="screen",
+            ),
+        ]
+    )

@@ -1,6 +1,6 @@
 """The OOT controller gain file (``pid.conf``), as an object.
 
-The file is a flat list of 24 numeric values, one per line, with ``#``-prefixed
+The file is a flat list of 25 numeric values, one per line, with ``#``-prefixed
 comment lines used both as section headers and to "comment out" alternative
 values. The order is fixed:
 
@@ -12,6 +12,7 @@ values. The order is fixed:
     rot   kd (x, y, z)          -> values[15:18]
     rot   ki (x, y, z)          -> values[18:21]
     rot   homogeneous           -> values[21:24]   (emax, mu, gamma)
+    mass                        -> values[24]      (drone mass in kg)
 
 :class:`PidConf` is the single source of truth for that layout: the bridge uses
 it to push gains to ``ootParams`` on connect, and ``controller_test`` uses it to
@@ -37,6 +38,7 @@ LAYOUT = (
     ('rot_kd', ('rot_kd_x', 'rot_kd_y', 'rot_kd_z')),
     ('rot_ki', ('rot_ki_x', 'rot_ki_y', 'rot_ki_z')),
     ('rot_homogeneous', ('rot_emax', 'rot_mu', 'rot_gamma')),
+    ('mass', ('mass',)),
 )
 
 PARAM_GROUP = 'ootParams'
@@ -44,7 +46,7 @@ PARAM_GROUP = 'ootParams'
 # Labels for the three components of each homogeneous block.
 HOMOGENEOUS_COMPONENTS = ('emax', 'mu', 'gamma')
 
-N_VALUES = sum(len(names) for _block, names in LAYOUT)  # 24
+N_VALUES = sum(len(names) for _block, names in LAYOUT)  # 25
 
 
 class PidConf:
