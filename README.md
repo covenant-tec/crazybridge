@@ -1,10 +1,10 @@
-# crazybridge
+# Crazybridge
 
-ROS 2 driver and flight bridge for the Bitcraze Crazyflie 2.X quadcopter with OptiTrack motion capture.
+ROS 2 bridge to fly the Bitcraze Crazyflie 2.X with OptiTrack motion capture.
 
-## Context
+This package connects to the Crazyflie via Crazyradio, fusing external OptiTrack tracking data with the onboard state estimator. It exposes ROS 2 services for autonomous flight and publishes real-time odometry.
 
-This package is part of the [crazyflie-optitrack](https://github.com/covenant-tec/crazyflie-optitrack) workspace, which manages build instructions, dependencies, and the full multi-node flight environment.
+This package runs inside the [crazyflie-optitrack](https://github.com/covenant-tec/crazyflie-optitrack) workspace.
 
 ## Tracking Modes
 
