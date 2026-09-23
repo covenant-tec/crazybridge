@@ -41,7 +41,7 @@ def generate_launch_description() -> LaunchDescription:
             description='Label for this run; names the output folder and the '
                         'rerun recording.'),
         DeclareLaunchArgument(
-            'tracking_mode', default_value='rigid_body',
+            'tracking_mode', default_value='marker',
             description="Mocap tracking mode: 'rigid_body' (6-DoF), 'marker' (single-ball 3-DoF), or 'auto'."),
         DeclareLaunchArgument(
             'pid_conf_path', default_value='',
