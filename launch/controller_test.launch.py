@@ -41,7 +41,7 @@ def generate_launch_description() -> LaunchDescription:
             description='Label for this run; names the output folder and the '
                         'rerun recording.'),
         DeclareLaunchArgument(
-            'tracking_mode', default_value='marker',
+            'tracking_mode', default_value='auto',
             description="Mocap tracking mode: 'rigid_body' (6-DoF), 'marker' (single-ball 3-DoF), or 'auto'."),
         DeclareLaunchArgument(
             'pid_conf_path', default_value='',
@@ -119,6 +119,7 @@ def generate_launch_description() -> LaunchDescription:
             'output_dir': LaunchConfiguration('output_dir'),
             # Same gain file the bridge loads; recorded with the metrics.
             'pid_conf_path': LaunchConfiguration('pid_conf_path'),
+            'tracking_mode': LaunchConfiguration('tracking_mode'),
             'takeoff_height_m': LaunchConfiguration('takeoff_height_m'),
             'goal_xyz': LaunchConfiguration('goal_xyz'),
             'circle_radius_m': LaunchConfiguration('circle_radius_m'),

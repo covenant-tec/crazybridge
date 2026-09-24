@@ -11,8 +11,8 @@ This package runs inside the [crazyflie-optitrack](https://github.com/covenant-t
 The bridge receives motion capture data from OptiTrack and forwards coordinates to the Crazyflie:
 
 * `rigid_body`: Uses 6-DoF position and orientation pose from `optitrack/rigid_body`.
-* `marker`: Default mode. Uses 3-DoF position coordinates from `optitrack/marker`.
-* `auto`: Automatically selects between rigid body and single marker based on the incoming OptiTrack stream.
+* `marker`: Uses 3-DoF position coordinates from `optitrack/marker`.
+* `auto`: Default mode. Automatically selects between rigid body and single marker based on the incoming OptiTrack stream.
 
 ## Configuration Files
 
@@ -21,7 +21,7 @@ Controller gains and vehicle mass are configured through the following files:
 * `config/pid.conf`: Tuned for single-marker flight with vehicle mass set to 0.029 kg.
 * `config/pid_rigid_body.conf`: Tuned for rigid-body flight with vehicle mass set to 0.037 kg.
 
-Each file contains 25 numeric values defining translational PID gains, translational homogeneous terms, rotational PID gains, rotational homogeneous terms, and vehicle mass.
+Each file contains 28 numeric values defining translational PID gains, translational homogeneous terms, rotational PID gains, rotational homogeneous terms, vehicle mass, and thrust/torque saturation limits.
 
 ## Running
 
@@ -33,8 +33,8 @@ ros2 launch crazybridge crazyoptitrack.launch.py
 
 If run without arguments, the launch file executes with default parameters:
 * Connects to radio address `radio://0/80/2M/E7E7E7E7E7`
-* Runs in `marker` mode
-* Loads `config/pid.conf`
+* Runs in `auto` mode
+* Loads `config/pid.conf` or `config/pid_rigid_body.conf` automatically
 * Opens a Rerun visualization window
 
 To override the default address or tracking mode:

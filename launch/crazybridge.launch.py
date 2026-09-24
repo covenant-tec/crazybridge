@@ -11,7 +11,7 @@ from launch_ros.actions import Node
 def generate_launch_description() -> LaunchDescription:
     tracking_mode_arg = DeclareLaunchArgument(
         'tracking_mode',
-        default_value='marker',
+        default_value='auto',
         description="Mocap tracking mode: 'rigid_body' (6-DoF), 'marker' (single-ball 3-DoF), or 'auto'.",
     )
 
