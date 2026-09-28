@@ -31,6 +31,7 @@ from geometry_msgs.msg import (
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import Imu
 from std_msgs.msg import Float32, Header
 from std_srvs.srv import SetBool
 
@@ -60,6 +61,7 @@ class CrazyBridge(Node):
         # i.e. 50 ms for pos/q and 10 ms for the OOT blocks.
         self.declare_parameter("log_period_ms", 50)
         self.declare_parameter("oot_log_period_ms", 10)
+        self.declare_parameter("imu_log_period_ms", 50)
         self.declare_parameter("connection_timeout_s", 10.0)
         self.declare_parameter("odom_frame_id", "world")
         self.declare_parameter("child_frame_id", "crazyflie")
@@ -83,6 +85,10 @@ class CrazyBridge(Node):
         self._oot_log_period_ms = self._sanitise_log_period(
             self.get_parameter("oot_log_period_ms").get_parameter_value().integer_value,
             "oot_log_period_ms",
+        )
+        self._imu_log_period_ms = self._sanitise_log_period(
+            self.get_parameter("imu_log_period_ms").get_parameter_value().integer_value,
+            "imu_log_period_ms",
         )
         self._odom_frame = (
             self.get_parameter("odom_frame_id").get_parameter_value().string_value
@@ -135,6 +141,7 @@ class CrazyBridge(Node):
         )
 
         self._pos = [0.0, 0.0, 0.0]
+        self._vel = [0.0, 0.0, 0.0]
         self._quat = [0.0, 0.0, 0.0, 1.0]  # (x, y, z, w)
         self._pos_lock = threading.Lock()
 
@@ -313,12 +320,23 @@ class CrazyBridge(Node):
         self._pos_log.add_variable("kalman.stateX", "float")
         self._pos_log.add_variable("kalman.stateY", "float")
         self._pos_log.add_variable("kalman.stateZ", "float")
+        self._pos_log.add_variable("stateEstimate.vx", "float")
+        self._pos_log.add_variable("stateEstimate.vy", "float")
+        self._pos_log.add_variable("stateEstimate.vz", "float")
 
         self._q_log = LogConfig(name="kalman_q", period_in_ms=self._log_period_ms)
         self._q_log.add_variable("kalman.q0", "float")
         self._q_log.add_variable("kalman.q1", "float")
         self._q_log.add_variable("kalman.q2", "float")
         self._q_log.add_variable("kalman.q3", "float")
+
+        self._imu_log = LogConfig(name="imu_raw", period_in_ms=self._imu_log_period_ms)
+        self._imu_log.add_variable("acc.x", "float")
+        self._imu_log.add_variable("acc.y", "float")
+        self._imu_log.add_variable("acc.z", "float")
+        self._imu_log.add_variable("gyro.x", "float")
+        self._imu_log.add_variable("gyro.y", "float")
+        self._imu_log.add_variable("gyro.z", "float")
 
         extra_period = self._sanitise_log_period(500, "extra_log_ms")
         self._pm_log = LogConfig(name="battery", period_in_ms=extra_period)
@@ -339,14 +357,17 @@ class CrazyBridge(Node):
         try:
             self._cf.log.add_config(self._pos_log)
             self._cf.log.add_config(self._q_log)
+            self._cf.log.add_config(self._imu_log)
             self._cf.log.add_config(self._pm_log)
             self._cf.log.add_config(self._setpoint_log)
             self._pos_log.data_received_cb.add_callback(self._on_pos_log)
             self._q_log.data_received_cb.add_callback(self._on_q_log)
+            self._imu_log.data_received_cb.add_callback(self._on_imu_log)
             self._pm_log.data_received_cb.add_callback(self._on_pm_log)
             self._setpoint_log.data_received_cb.add_callback(self._on_setpoint_log)
             self._pos_log.start()
             self._q_log.start()
+            self._imu_log.start()
             self._pm_log.start()
             self._setpoint_log.start()
         except Exception as exc:
@@ -609,7 +630,25 @@ class CrazyBridge(Node):
                 float(data["kalman.stateY"]),
                 float(data["kalman.stateZ"]),
             ]
+            self._vel = [
+                float(data.get("stateEstimate.vx", 0.0)),
+                float(data.get("stateEstimate.vy", 0.0)),
+                float(data.get("stateEstimate.vz", 0.0)),
+            ]
         self._publish_odom()
+
+    def _on_imu_log(self, _timestamp, data, _logconf) -> None:
+        msg = Imu()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self._child_frame
+        # acc in Gs (1G = 9.80665 m/s^2), gyro in deg/s (convert to rad/s)
+        msg.linear_acceleration.x = float(data["acc.x"]) * 9.80665
+        msg.linear_acceleration.y = float(data["acc.y"]) * 9.80665
+        msg.linear_acceleration.z = float(data["acc.z"]) * 9.80665
+        msg.angular_velocity.x = math.radians(float(data["gyro.x"]))
+        msg.angular_velocity.y = math.radians(float(data["gyro.y"]))
+        msg.angular_velocity.z = math.radians(float(data["gyro.z"]))
+        self._pubs.imu.publish(msg)
 
     def _on_q_log(self, _timestamp, data, _logconf) -> None:
         # Bitcraze kalman logs (q0, q1, q2, q3) as (w, x, y, z).
@@ -685,6 +724,7 @@ class CrazyBridge(Node):
         with self._pos_lock:
             pos = tuple(self._pos)
             quat = tuple(self._quat)  # (x, y, z, w)
+            vel = tuple(self._vel)
         msg.pose.pose.position.x = pos[0]
         msg.pose.pose.position.y = pos[1]
         msg.pose.pose.position.z = pos[2]
@@ -692,6 +732,9 @@ class CrazyBridge(Node):
         msg.pose.pose.orientation.y = quat[1]
         msg.pose.pose.orientation.z = quat[2]
         msg.pose.pose.orientation.w = quat[3]
+        msg.twist.twist.linear.x = vel[0]
+        msg.twist.twist.linear.y = vel[1]
+        msg.twist.twist.linear.z = vel[2]
         self._pubs.odom.publish(msg)
 
     @staticmethod
@@ -844,6 +887,7 @@ class CrazyBridge(Node):
         for name in (
             "_pos_log",
             "_q_log",
+            "_imu_log",
             "_setpoint_log",
             "_pos_err_log",
             "_q_err_log",

@@ -40,13 +40,18 @@ import numpy as np
 
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 
-from geometry_msgs.msg import PointStamped, Vector3
+from geometry_msgs.msg import PointStamped, PoseStamped, Vector3
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu
 from std_msgs.msg import Float32
 
 from crazybridge import metrics
-from crazybridge.interface import BridgeClientNode, Topics
+from ament_index_python.packages import get_package_share_directory
+import os
+
+from crazybridge.interface import BridgeClientNode, Topics, TrackingMode
 from crazybridge.pid_conf import PidConf
 
 
@@ -63,12 +68,16 @@ class ControllerTest(BridgeClientNode):
         # The same pid.conf the bridge loaded; recorded alongside the metrics so
         # a run's numbers can be traced back to the gains that produced them.
         self.declare_parameter("pid_conf_path", "")
+        self.declare_parameter("tracking_mode", TrackingMode.AUTO)
 
         # telemetry topic names (odom_topic comes from the base)
         self.declare_parameter("setpoint_topic", Topics.SETPOINT)
         self.declare_parameter("thrust_topic", Topics.THRUST)
         self.declare_parameter("torque_topic", Topics.TORQUE)
         self.declare_parameter("pos_error_topic", Topics.POS_ERROR)
+        self.declare_parameter("imu_topic", Topics.IMU)
+        self.declare_parameter("rigid_body_topic", Topics.RIGID_BODY)
+        self.declare_parameter("marker_topic", Topics.MARKER)
 
         # trajectory geometry
         self.declare_parameter("takeoff_height_m", 1.0)
@@ -94,6 +103,9 @@ class ControllerTest(BridgeClientNode):
         self._pos_err: list[list[float]] = []
         self._odom: list[list[float]] = []
         self._setpoint: list[list[float]] = []
+        self._raw_mocap: list[list[float]] = []
+        self._raw_mocap_source: str = "none"
+        self._imu: list[list[float]] = []
 
         self.create_subscription(Float32, self._sp("thrust_topic"), self._thrust_cb, 50)
         self.create_subscription(Vector3, self._sp("torque_topic"), self._torque_cb, 50)
@@ -102,6 +114,22 @@ class ControllerTest(BridgeClientNode):
         )
         self.create_subscription(
             PointStamped, self._sp("setpoint_topic"), self._setpoint_cb, 50
+        )
+        self.create_subscription(Imu, self._sp("imu_topic"), self._imu_cb, 50)
+        qos_best_effort = QoSProfile(
+            depth=10, reliability=ReliabilityPolicy.BEST_EFFORT
+        )
+        self.create_subscription(
+            PoseStamped,
+            self._sp("rigid_body_topic"),
+            self._rigid_body_cb,
+            qos_best_effort,
+        )
+        self.create_subscription(
+            PointStamped,
+            self._sp("marker_topic"),
+            self._marker_cb,
+            qos_best_effort,
         )
 
     # -- helpers ---------------------------------------------------------------
@@ -129,12 +157,53 @@ class ControllerTest(BridgeClientNode):
         with self._lock:
             self._setpoint.append([self._now(), p.x, p.y, p.z])
 
-    def on_odometry(self, msg: Odometry) -> None:
-        # Base already stashed the latest message; we additionally record the
-        # flown path for the trajectory overlay.
-        p = msg.pose.pose.position
+    def _imu_cb(self, msg: Imu) -> None:
         with self._lock:
-            self._odom.append([self._now(), p.x, p.y, p.z])
+            self._imu.append([
+                self._now(),
+                msg.linear_acceleration.x,
+                msg.linear_acceleration.y,
+                msg.linear_acceleration.z,
+                msg.angular_velocity.x,
+                msg.angular_velocity.y,
+                msg.angular_velocity.z,
+            ])
+
+    def _rigid_body_cb(self, msg: PoseStamped) -> None:
+        p = msg.pose.position
+        q = msg.pose.orientation
+        with self._lock:
+            self._raw_mocap.append([
+                self._now(),
+                p.x, p.y, p.z,
+                q.x, q.y, q.z, q.w,
+            ])
+            self._raw_mocap_source = TrackingMode.RIGID_BODY
+
+    def _marker_cb(self, msg: PointStamped) -> None:
+        with self._lock:
+            if self._raw_mocap_source != TrackingMode.RIGID_BODY:
+                p = msg.point
+                self._raw_mocap.append([
+                    self._now(),
+                    p.x, p.y, p.z,
+                    0.0, 0.0, 0.0, 1.0,
+                ])
+                self._raw_mocap_source = TrackingMode.MARKER
+
+    def on_odometry(self, msg: Odometry) -> None:
+        # Base already stashed the latest message; we record full odometry
+        # (pos, quat, vel) for trajectory overlay and flight telemetry export.
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        v = msg.twist.twist.linear
+        with self._lock:
+            self._odom.append([
+                self._now(),
+                p.x, p.y, p.z,
+                q.x, q.y, q.z, q.w,
+                v.x, v.y, v.z,
+            ])
 
     # -- blocking service call -------------------------------------------------
     def _call(self, client, request, label: str, timeout: float = 15.0):
@@ -246,11 +315,17 @@ class ControllerTest(BridgeClientNode):
                 "pos_err": np.array(self._pos_err, dtype=float)
                 if self._pos_err
                 else np.empty((0, 4)),
+                "imu": np.array(self._imu, dtype=float)
+                if self._imu
+                else np.empty((0, 7)),
+                "raw_mocap": np.array(self._raw_mocap, dtype=float)
+                if self._raw_mocap
+                else np.empty((0, 8)),
             }
 
     def _traj(self) -> dict:
         with self._lock:
-            odom = np.array(self._odom, dtype=float) if self._odom else np.empty((0, 4))
+            odom = np.array(self._odom, dtype=float) if self._odom else np.empty((0, 11))
             setp = (
                 np.array(self._setpoint, dtype=float)
                 if self._setpoint
@@ -268,10 +343,27 @@ class ControllerTest(BridgeClientNode):
         """The gains this run flew with, as ``(flat dict | None, path)``."""
         path = self._sp("pid_conf_path")
         if not path:
-            self.get_logger().warning(
-                "pid_conf_path not set; run will be recorded without gains"
-            )
-            return None, ""
+            tracking_mode = self._sp("tracking_mode")
+            if tracking_mode == TrackingMode.AUTO:
+                with self._lock:
+                    active = self._raw_mocap_source
+                if active in (TrackingMode.RIGID_BODY, TrackingMode.MARKER):
+                    detected = active
+                else:
+                    detected = TrackingMode.RIGID_BODY
+                conf_file = "pid.conf" if detected == TrackingMode.MARKER else "pid_rigid_body.conf"
+                path = os.path.join(
+                    get_package_share_directory("crazybridge"), "config", conf_file
+                )
+                self.get_logger().info(
+                    f"[AUTO MODE] Auto-resolved PID path based on detected stream ({detected}): {path}"
+                )
+            else:
+                conf_file = "pid.conf" if tracking_mode == TrackingMode.MARKER else "pid_rigid_body.conf"
+                path = os.path.join(
+                    get_package_share_directory("crazybridge"), "config", conf_file
+                )
+                self.get_logger().info(f"Auto-resolved default PID path for mode={tracking_mode!r}: {path}")
         try:
             conf = PidConf.load(path)
         except Exception as exc:
@@ -280,7 +372,8 @@ class ControllerTest(BridgeClientNode):
         return conf.as_dict(), path
 
     def report(self, ts: dict) -> dict:
-        m = metrics.compute_metrics(self._samples(), ts)
+        samples = self._samples()
+        m = metrics.compute_metrics(samples, ts)
         gains, pid_conf_path = self._gains()
         config = self._sp("config_name")
         out_dir = self._sp("output_dir")
@@ -290,6 +383,7 @@ class ControllerTest(BridgeClientNode):
             ts,
             m,
             self._traj(),
+            samples=samples,
             gains=gains,
             pid_conf_path=pid_conf_path,
         )

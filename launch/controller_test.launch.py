@@ -51,7 +51,7 @@ def generate_launch_description() -> LaunchDescription:
             description='Parent directory; this run writes into '
                         '<output_dir>/<config_name>/.'),
         DeclareLaunchArgument(
-            'uri', default_value='radio://0/100/2M',
+            'uri', default_value='radio://0/80/2M/E7E7E7E7E7',
             description='cflib URI (hardware default; sim = udp://127.0.0.1:19850).'),
         DeclareLaunchArgument(
             'use_optitrack', default_value='true',

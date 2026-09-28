@@ -13,6 +13,7 @@ values. The order is fixed:
     rot   ki (x, y, z)          -> values[18:21]
     rot   homogeneous           -> values[21:24]   (emax, mu, gamma)
     mass                        -> values[24]      (drone mass in kg)
+    saturation                  -> values[25:28]   (thrust_max, thrust_min, torque_max)
 
 :class:`PidConf` is the single source of truth for that layout: the bridge uses
 it to push gains to ``ootParams`` on connect, and ``controller_test`` uses it to
@@ -39,6 +40,7 @@ LAYOUT = (
     ('rot_ki', ('rot_ki_x', 'rot_ki_y', 'rot_ki_z')),
     ('rot_homogeneous', ('rot_emax', 'rot_mu', 'rot_gamma')),
     ('mass', ('mass',)),
+    ('saturation', ('thrust_max', 'thrust_min', 'torque_max')),
 )
 
 PARAM_GROUP = 'ootParams'

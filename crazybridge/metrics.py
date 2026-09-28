@@ -34,6 +34,7 @@ FILE_METRICS_JSON = 'metrics.json'
 FILE_METRICS_CSV = 'metrics.csv'
 FILE_TRAJ_NPZ = 'traj.npz'
 FILE_PID_CONF = 'pid.conf'
+FILE_TELEMETRY_CSV = 'flight_telemetry.csv'
 
 # numpy 2.0 renamed trapz -> trapezoid (and later removed the old name).
 try:
@@ -146,45 +147,175 @@ def run_dir(out_dir: str, config: str) -> str:
     return os.path.join(out_dir, config)
 
 
-def write_reports(out_dir: str, config: str, ts: dict, metrics: dict,
-                  traj: dict, gains: dict | None = None,
-                  pid_conf_path: str | None = None) -> dict:
+def _interp_array(arr: np.ndarray, t_eval: np.ndarray, ncols: int) -> np.ndarray:
+    """Linearly interpolate columns 1..ncols of `arr` (col 0 = timestamp) onto `t_eval`."""
+    if arr is None or arr.size == 0 or len(arr.shape) != 2 or arr.shape[0] < 2:
+        return np.zeros((len(t_eval), ncols))
+    t_source = arr[:, 0]
+    unique_mask = np.concatenate(([True], np.diff(t_source) > 1e-9))
+    arr_clean = arr[unique_mask]
+    if arr_clean.shape[0] < 2:
+        return np.zeros((len(t_eval), ncols))
+
+    out = np.zeros((len(t_eval), ncols))
+    actual_cols = min(ncols, arr_clean.shape[1] - 1)
+    for i in range(actual_cols):
+        out[:, i] = np.interp(t_eval, arr_clean[:, 0], arr_clean[:, i + 1])
+    return out
+
+
+def write_telemetry_csv(
+    dest: str, ts: dict, traj: dict, samples: dict | None, dt: float = 0.02
+) -> str:
+    """Write time-synchronized telemetry dataset to ``flight_telemetry.csv``."""
+    t_start = float(ts.get("t_start", 0.0))
+    t_end = float(ts.get("t_land_end", t_start + 1.0))
+    if t_end <= t_start:
+        t_end = t_start + 1.0
+
+    t_eval = np.arange(t_start, t_end, dt)
+    if len(t_eval) == 0:
+        t_eval = np.array([t_start])
+
+    samples_dict = samples or {}
+    raw_mocap = np.asarray(samples_dict.get("raw_mocap", np.empty((0, 8))), dtype=float)
+    imu = np.asarray(samples_dict.get("imu", np.empty((0, 7))), dtype=float)
+    thrust = np.asarray(samples_dict.get("thrust", np.empty((0, 2))), dtype=float)
+    torque = np.asarray(samples_dict.get("torque", np.empty((0, 4))), dtype=float)
+    pos_err = np.asarray(samples_dict.get("pos_err", np.empty((0, 4))), dtype=float)
+    odom = np.asarray(traj.get("odom", np.empty((0, 11))), dtype=float)
+    setpoint = np.asarray(traj.get("setpoint", np.empty((0, 4))), dtype=float)
+
+    interp_raw = _interp_array(raw_mocap, t_eval, 7)
+    interp_odom = _interp_array(odom, t_eval, 10)
+    interp_imu = _interp_array(imu, t_eval, 6)
+    interp_sp = _interp_array(setpoint, t_eval, 3)
+    interp_thrust = _interp_array(thrust, t_eval, 1)
+    interp_torque = _interp_array(torque, t_eval, 3)
+    interp_err = _interp_array(pos_err, t_eval, 3)
+
+    rel_t = t_eval - t_eval[0]
+    data = np.column_stack([
+        rel_t,
+        t_eval,
+        interp_raw,
+        interp_odom,
+        interp_imu,
+        interp_sp,
+        interp_thrust,
+        interp_torque,
+        interp_err,
+    ])
+
+    headers = [
+        "time_rel",
+        "timestamp",
+        "raw_x",
+        "raw_y",
+        "raw_z",
+        "raw_qx",
+        "raw_qy",
+        "raw_qz",
+        "raw_qw",
+        "fused_x",
+        "fused_y",
+        "fused_z",
+        "fused_qx",
+        "fused_qy",
+        "fused_qz",
+        "fused_qw",
+        "fused_vx",
+        "fused_vy",
+        "fused_vz",
+        "imu_ax",
+        "imu_ay",
+        "imu_az",
+        "imu_gx",
+        "imu_gy",
+        "imu_gz",
+        "sp_x",
+        "sp_y",
+        "sp_z",
+        "thrust",
+        "torque_x",
+        "torque_y",
+        "torque_z",
+        "pos_err_x",
+        "pos_err_y",
+        "pos_err_z",
+    ]
+
+    csv_path = os.path.join(dest, FILE_TELEMETRY_CSV)
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(data)
+
+    return csv_path
+
+
+def write_reports(
+    out_dir: str,
+    config: str,
+    ts: dict,
+    metrics: dict,
+    traj: dict,
+    samples: dict | None = None,
+    gains: dict | None = None,
+    pid_conf_path: str | None = None,
+) -> dict:
     """Write one run's artefacts into ``<out_dir>/<config>/``.
 
     Filenames are fixed (``metrics.json``, ``metrics.csv``, ``traj.npz``,
-    ``pid.conf``) so they are identical across runs; the *directory* carries the
-    config name. ``gains`` (the parsed pid.conf, flat ``name -> value``) and a
-    verbatim copy of ``pid_conf_path`` are recorded so a run's numbers can
-    always be traced back to the gains that produced them.
+    ``flight_telemetry.csv``, ``pid.conf``) so they are identical across runs;
+    the *directory* carries the config name. ``gains`` (the parsed pid.conf, flat
+    ``name -> value``) and a verbatim copy of ``pid_conf_path`` are recorded so a
+    run's numbers can always be traced back to the gains that produced them.
 
     Returns the flattened metric row (useful for logging / aggregation).
     """
     dest = run_dir(out_dir, config)
     os.makedirs(dest, exist_ok=True)
 
-    report = {'config': config, 'timestamps': ts, 'metrics': metrics}
+    report = {"config": config, "timestamps": ts, "metrics": metrics}
     if gains is not None:
-        report['gains'] = gains
+        report["gains"] = gains
     if pid_conf_path:
-        report['pid_conf_path'] = os.path.abspath(pid_conf_path)
-    with open(os.path.join(dest, FILE_METRICS_JSON), 'w') as f:
+        report["pid_conf_path"] = os.path.abspath(pid_conf_path)
+    with open(os.path.join(dest, FILE_METRICS_JSON), "w") as f:
         json.dump(report, f, indent=2)
 
     row = flatten_row(config, metrics)
-    with open(os.path.join(dest, FILE_METRICS_CSV), 'w', newline='') as f:
+    with open(os.path.join(dest, FILE_METRICS_CSV), "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))
         writer.writeheader()
         writer.writerow(row)
 
+    samples_dict = samples or {}
+    raw_mocap = np.asarray(samples_dict.get("raw_mocap", np.empty((0, 8))), dtype=float)
+    imu = np.asarray(samples_dict.get("imu", np.empty((0, 7))), dtype=float)
+    thrust = np.asarray(samples_dict.get("thrust", np.empty((0, 2))), dtype=float)
+    torque = np.asarray(samples_dict.get("torque", np.empty((0, 4))), dtype=float)
+    pos_err = np.asarray(samples_dict.get("pos_err", np.empty((0, 4))), dtype=float)
+
     np.savez(
         os.path.join(dest, FILE_TRAJ_NPZ),
-        odom=np.asarray(traj.get('odom', np.empty((0, 4))), dtype=float),
-        setpoint=np.asarray(traj.get('setpoint', np.empty((0, 4))), dtype=float),
-        goal=np.asarray(traj.get('goal', [0.0, 0.0, 0.0]), dtype=float),
-        radius=float(traj.get('radius', 0.0)),
-        clockwise=bool(traj.get('clockwise', False)),
-        t_start=float(ts['t_start']), t_land_end=float(ts['t_land_end']),
+        odom=np.asarray(traj.get("odom", np.empty((0, 11))), dtype=float),
+        setpoint=np.asarray(traj.get("setpoint", np.empty((0, 4))), dtype=float),
+        raw_mocap=raw_mocap,
+        imu=imu,
+        thrust=thrust,
+        torque=torque,
+        pos_err=pos_err,
+        goal=np.asarray(traj.get("goal", [0.0, 0.0, 0.0]), dtype=float),
+        radius=float(traj.get("radius", 0.0)),
+        clockwise=bool(traj.get("clockwise", False)),
+        t_start=float(ts["t_start"]),
+        t_land_end=float(ts["t_land_end"]),
     )
+
+    # Export synchronized 50 Hz telemetry table to CSV
+    write_telemetry_csv(dest, ts, traj, samples, dt=0.02)
 
     # Copy the gain file itself, so the run folder is self-contained even if the
     # source pid.conf is later edited in place.

@@ -24,6 +24,7 @@ from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import Point, PointStamped, Quaternion, Vector3
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from sensor_msgs.msg import Imu
 from std_msgs.msg import Float32
 from std_srvs.srv import SetBool
 
@@ -43,6 +44,7 @@ class Create:
     """Names the bridge node passes to create_publisher / create_service."""
 
     ODOM = "~/odometry"
+    IMU = "~/imu"
     BATTERY = "~/battery"
     THRUST = "thrust"
     TORQUE = "torque"
@@ -63,6 +65,7 @@ class Topics:
     """Fully-qualified topic names for clients (TUI, test node, rerun)."""
 
     ODOM = "/crazybridge/odometry"
+    IMU = "/crazybridge/imu"
     BATTERY = "/crazybridge/battery"
     THRUST = "/thrust"
     TORQUE = "/torque"
@@ -109,6 +112,7 @@ class BridgePublishers:
             Quaternion, Create.ORI_DESIRED, 1
         )
         self.orientation_error = node.create_publisher(Quaternion, Create.ORI_ERROR, 1)
+        self.imu = node.create_publisher(Imu, Create.IMU, 10)
 
 
 class BridgeClientNode(Node):

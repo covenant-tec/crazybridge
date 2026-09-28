@@ -4,6 +4,7 @@ import numpy as np
 from rclpy.node import Node
 from std_msgs.msg import Float32
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu
 from scipy.spatial.transform import Rotation
 from geometry_msgs.msg import Vector3, Quaternion, PoseWithCovariance, Pose, Point, PointStamped
 
@@ -45,6 +46,7 @@ class Rerun(Node):
         self.create_subscription(Quaternion, 'orientation/desired', self._qd_cb, 1)
         self.create_subscription(Quaternion, 'orientation/error', self._qe_cb, 1)
         self.create_subscription(Odometry, '/crazybridge/odometry', self._odometry_cb, 1)
+        self.create_subscription(Imu, '/crazybridge/imu', self._imu_cb, 10)
         self.create_subscription(PointStamped, 'setpoint', self._setpoint_cb, 1)
 
     @staticmethod
@@ -85,6 +87,14 @@ class Rerun(Node):
         rr.log("/input/torque/z", rr.Scalars(msg.z))
 
 
+    def _imu_cb(self, msg: Imu):
+        rr.log("/imu/accel/x", rr.Scalars(msg.linear_acceleration.x))
+        rr.log("/imu/accel/y", rr.Scalars(msg.linear_acceleration.y))
+        rr.log("/imu/accel/z", rr.Scalars(msg.linear_acceleration.z))
+        rr.log("/imu/gyro/x", rr.Scalars(msg.angular_velocity.x))
+        rr.log("/imu/gyro/y", rr.Scalars(msg.angular_velocity.y))
+        rr.log("/imu/gyro/z", rr.Scalars(msg.angular_velocity.z))
+
     def _pos_err_cb(self, msg: Vector3):
         if abs(msg.x) > 3:
             msg.x = 0.0
@@ -116,6 +126,11 @@ class Rerun(Node):
         rr.log("/orientation/x", rr.Scalars(x))
         rr.log("/orientation/y", rr.Scalars(y))
         rr.log("/orientation/z", rr.Scalars(z))
+
+        v = msg.twist.twist.linear
+        rr.log("/odometry/vel/x", rr.Scalars(v.x))
+        rr.log("/odometry/vel/y", rr.Scalars(v.y))
+        rr.log("/odometry/vel/z", rr.Scalars(v.z))
 
     def _setpoint_cb(self, msg: PointStamped):
         p: Point = msg.point
