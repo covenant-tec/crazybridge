@@ -23,6 +23,21 @@ Controller gains and vehicle mass are configured through the following files:
 
 Each file contains 28 numeric values defining translational PID gains, translational homogeneous terms, rotational PID gains, rotational homogeneous terms, vehicle mass, and thrust/torque saturation limits.
 
+## Installation & Build
+
+Activate the Python virtual environment and install the required dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+To compile the package within the ROS 2 workspace, navigate to the `src` directory and execute the build using Python's colcon module to ensure the active virtual environment is used:
+
+```bash
+cd ..
+python -m colcon build --symlink-install --packages-select crazybridge crazybridge_interfaces
+```
+
 ## Running
 
 ### Flight with OptiTrack

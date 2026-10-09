@@ -13,7 +13,7 @@ setup(
         ('share/' + package_name + '/launch', ['launch/crazybridge.launch.py', 'launch/crazyoptitrack.launch.py', 'launch/controller_test.launch.py']),
         ('share/' + package_name + '/config', ['config/pid.conf', 'config/pid_rigid_body.conf']),
     ],
-    install_requires=['setuptools', 'cflib', 'textual', 'rerun-sdk', 'numpy'],
+    install_requires=['setuptools', 'cflib', 'textual', 'rerun-sdk', 'numpy', 'scipy'],
     zip_safe=True,
     maintainer='Kevin Martinez',
     maintainer_email='kevin@nuclea.solutions',
