@@ -193,15 +193,15 @@ def test_from_env_reads_url_and_token(monkeypatch):
 # -- metrics payload ----------------------------------------------------------
 def test_ledger_results_labels_units_and_skips_timestamps():
     ts = {'t_start': 0.0, 't_takeoff_end': 1.0, 't_regulate_end': 2.0,
-          't_circle_end': 3.0, 't_land_end': 4.0}
+          't_track_end': 3.0, 't_land_end': 4.0}
     m = metrics.compute_metrics({}, ts)
     results = metrics.ledger_results(m)
     labels = {r['label']: r for r in results}
 
-    assert 'circle.t_start' not in labels and 'circle.t_end' not in labels
-    assert labels['circle.duration_s']['value'] == 1.0
-    assert labels['circle.duration_s']['unit'] == 's'
-    assert labels['circle.int_err_norm']['unit'] == 'm·s'
+    assert 'track.t_start' not in labels and 'track.t_end' not in labels
+    assert labels['track.duration_s']['value'] == 1.0
+    assert labels['track.duration_s']['unit'] == 's'
+    assert labels['track.int_err_norm']['unit'] == 'm·s'
     assert labels['total.rmse_norm']['unit'] == 'm'
     assert labels['land.int_torque_norm']['unit'] == 'N·m·s'
     assert all(math.isfinite(r['value']) for r in results)

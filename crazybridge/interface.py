@@ -27,7 +27,9 @@ from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32
 from std_srvs.srv import SetBool
 
-from crazybridge_interfaces.srv import GoTo, Land, Spiral, Takeoff
+from crazybridge_interfaces.msg import TrajectoryPolynomialPiece
+from crazybridge_interfaces.srv import (
+    GoTo, Land, Spiral, StartTrajectory, Takeoff, UploadTrajectory)
 
 BRIDGE_NODE = 'crazybridge'
 
@@ -47,6 +49,8 @@ class Create:
     SRV_LAND = '~/land'
     SRV_GOTO = '~/go_to'
     SRV_SPIRAL = '~/spiral'
+    SRV_UPLOAD_TRAJ = '~/upload_trajectory'
+    SRV_START_TRAJ = '~/start_trajectory'
     SRV_KILL = '~/kill'
 
 
@@ -69,6 +73,8 @@ class Services:
     LAND = '/crazybridge/land'
     GOTO = '/crazybridge/go_to'
     SPIRAL = '/crazybridge/spiral'
+    UPLOAD_TRAJ = '/crazybridge/upload_trajectory'
+    START_TRAJ = '/crazybridge/start_trajectory'
     KILL = '/crazybridge/kill'
 
 
@@ -117,12 +123,18 @@ class BridgeClientNode(Node):
         self.declare_parameter('land_srv', Services.LAND)
         self.declare_parameter('goto_srv', Services.GOTO)
         self.declare_parameter('spiral_srv', Services.SPIRAL)
+        self.declare_parameter('upload_traj_srv', Services.UPLOAD_TRAJ)
+        self.declare_parameter('start_traj_srv', Services.START_TRAJ)
         self.declare_parameter('kill_srv', Services.KILL)
 
         self.takeoff_cli = self.create_client(Takeoff, self._sp('takeoff_srv'))
         self.land_cli = self.create_client(Land, self._sp('land_srv'))
         self.goto_cli = self.create_client(GoTo, self._sp('goto_srv'))
         self.spiral_cli = self.create_client(Spiral, self._sp('spiral_srv'))
+        self.upload_traj_cli = self.create_client(
+            UploadTrajectory, self._sp('upload_traj_srv'))
+        self.start_traj_cli = self.create_client(
+            StartTrajectory, self._sp('start_traj_srv'))
         self.kill_cli = self.create_client(SetBool, self._sp('kill_srv'))
 
         # Odometry is the one subscription every client needs. The base keeps
@@ -170,6 +182,8 @@ class BridgeClientNode(Node):
         return {
             'takeoff': self.takeoff_cli, 'land': self.land_cli,
             'go_to': self.goto_cli, 'spiral': self.spiral_cli,
+            'upload_trajectory': self.upload_traj_cli,
+            'start_trajectory': self.start_traj_cli,
             'kill': self.kill_cli
         }
 
@@ -231,6 +245,37 @@ class BridgeClientNode(Node):
         req.sideways = bool(sideways)
         req.clockwise = bool(clockwise)
         req.group_mask = int(group_mask)
+        return req
+
+    @staticmethod
+    def upload_trajectory_request(pieces, trajectory_id: int = 1,
+                                  piece_offset: int = 0):
+        """Build an upload request from ``(n, 33)`` rows laid out as
+        ``[duration, x^0..x^7, y^0..y^7, z^0..z^7, yaw^0..yaw^7]`` (the layout
+        produced by :func:`crazybridge.trajectory.generate`)."""
+        req = UploadTrajectory.Request()
+        req.trajectory_id = int(trajectory_id)
+        req.piece_offset = int(piece_offset)
+        for row in pieces:
+            piece = TrajectoryPolynomialPiece()
+            piece.duration = seconds_to_duration(float(row[0]))
+            piece.poly_x = [float(c) for c in row[1:9]]
+            piece.poly_y = [float(c) for c in row[9:17]]
+            piece.poly_z = [float(c) for c in row[17:25]]
+            piece.poly_yaw = [float(c) for c in row[25:33]]
+            req.pieces.append(piece)
+        return req
+
+    @staticmethod
+    def start_trajectory_request(trajectory_id: int = 1, timescale: float = 1.0,
+                                 relative: bool = False, reversed: bool = False,
+                                 group_mask: int = 0):
+        req = StartTrajectory.Request()
+        req.group_mask = int(group_mask)
+        req.trajectory_id = int(trajectory_id)
+        req.timescale = float(timescale)
+        req.reversed = bool(reversed)
+        req.relative = bool(relative)
         return req
 
     @staticmethod
