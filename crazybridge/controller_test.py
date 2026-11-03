@@ -29,6 +29,16 @@ The filenames are identical across runs -- the folder name carries the config.
 node parses it (via :class:`crazybridge.pid_conf.PidConf`) and stores the gains
 in ``metrics.json`` so results are never orphaned from the gains behind them.
 
+Ledger: unless ``ledger_enabled`` is false, the run is also registered in the
+ledger experiment log (``ledger_experiment``) as a ``pending`` run before
+takeoff. On success its metrics are added as numeric results, every file in the
+run folder is attached and the outcome becomes ``success``; if the sequence
+fails the outcome becomes ``failure`` with the error in the notes. Ledger is
+strictly best-effort -- if it is down, slow or erroring, the flight, the local
+report files and the exit code are unaffected and only warnings are logged. The
+API URL / token come from ``ledger_url`` or ``LEDGER_API_URL`` and
+``LEDGER_API_TOKEN``. See :mod:`crazybridge.ledger`.
+
 Visualisation is left to the ``rerun`` node (launched alongside), which draws the
 planned-vs-actual paths live from the same ``setpoint`` / ``odometry`` topics.
 
@@ -39,7 +49,9 @@ odometry subscription and the parameter accessors all come from
 """
 from __future__ import annotations
 
+import os
 import threading
+from datetime import datetime
 from time import monotonic, sleep
 
 import numpy as np
@@ -53,6 +65,7 @@ from std_msgs.msg import Float32
 
 from crazybridge import metrics, trajectory
 from crazybridge.interface import BridgeClientNode, Topics
+from crazybridge.ledger import LedgerClient
 from crazybridge.pid_conf import PidConf
 
 
@@ -105,6 +118,16 @@ class ControllerTest(BridgeClientNode):
         self.declare_parameter('upload_timeout_s', 60.0)
 
         self.declare_parameter('startup_timeout_s', 30.0)
+
+        # ledger experiment log (best-effort; see module docstring)
+        self.declare_parameter('ledger_enabled', True)
+        self.declare_parameter('ledger_url', '')   # '' -> LEDGER_API_URL / default
+        self.declare_parameter('ledger_experiment',
+                               'Crazyflie OOT Controller Comparison')
+        self.declare_parameter('ledger_timeout_s', 3.0)
+        self._ledger: LedgerClient | None = None
+        self._ledger_run: dict | None = None
+        self._ledger_experiment_id: int | None = None
 
         # Set once takeoff is commanded; gates the emergency land + kill so a
         # pre-flight failure (bad params, failed upload) never latches the
@@ -351,6 +374,95 @@ class ControllerTest(BridgeClientNode):
             f'wrote run artefacts to {metrics.run_dir(out_dir, config)}')
         return m
 
+    # -- ledger (best-effort: never raises, never affects the flight) -----------
+    def _ledger_params(self) -> dict:
+        """What this run tested: identity, trajectory, durations and gains."""
+        params: dict = {'config_name': self._sp('config_name')}
+        gains, pid_conf_path = self._gains()
+        if pid_conf_path:
+            params['pid_conf_path'] = os.path.abspath(pid_conf_path)
+        # Mixed int / float / str parameters, so read the typed value directly.
+        for name in ('takeoff_height_m', 'takeoff_duration_s', 'settle_s',
+                     'goto_duration_s', 'regulate_s', 'track_settle_s',
+                     'land_duration_s', 'track_shape', 'track_peak_speed_mps',
+                     'track_laps', 'track_ramp_s', 'track_n_pieces',
+                     'track_timescale', 'spiral_radius_m', 'spiral_ascent_m'):
+            params[name] = self.get_parameter(name).value
+        for name in ('goal_xyz', 'figure8_amplitude_xyz'):
+            vec = self._fp_array(name)
+            if len(vec) >= 3:
+                params[name] = ', '.join(f'{v:g}' for v in vec[:3])
+        for name, value in (gains or {}).items():
+            params[f'gain.{name}'] = value
+        return params
+
+    def ledger_register(self) -> None:
+        """Register this run as ``pending`` in ledger, before takeoff."""
+        try:
+            if not self._bp('ledger_enabled'):
+                return
+            client = LedgerClient.from_env(
+                self._sp('ledger_url') or None,
+                timeout_s=self._dp('ledger_timeout_s'),
+                log=self.get_logger().warning)
+            exp_id = client.ensure_experiment(
+                self._sp('ledger_experiment'),
+                subject='Crazyflie OOT controller on hardware (OptiTrack)',
+                objective='Compare OOT controller gain sets on an identical '
+                          'takeoff / regulate / tracking-trajectory / land '
+                          'sequence.',
+                description='One run per gain config, flown by '
+                            'crazybridge controller_test.')
+            if exp_id is None:
+                return
+            config = self._sp('config_name')
+            stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            run = client.start_run(exp_id, f'{config} ({stamp})',
+                                   self._ledger_params())
+            if run is None:
+                return
+            self._ledger, self._ledger_run = client, run
+            self._ledger_experiment_id = exp_id
+            self.get_logger().info(
+                f'ledger: registered run #{run.get("seq")} (id {run.get("id")}) '
+                f'in experiment #{exp_id}')
+        except Exception as exc:
+            self.get_logger().warning(f'ledger registration failed: {exc}')
+
+    def ledger_finish(self, m: dict | None = None,
+                      error: str | None = None) -> None:
+        """Close out the ledger run: results + files + outcome (or failure)."""
+        if self._ledger is None or self._ledger_run is None:
+            return
+        run, self._ledger_run = self._ledger_run, None  # finish at most once
+        try:
+            run_id = run['id']
+            if error is not None:
+                self._ledger.update_run(
+                    run_id, outcome='failure',
+                    notes=f'test sequence failed: {error}')
+            else:
+                if m is not None:
+                    self._ledger.add_results(run_id, metrics.ledger_results(m))
+                dest = metrics.run_dir(self._sp('output_dir'),
+                                       self._sp('config_name'))
+                files = sorted(
+                    os.path.join(dest, f) for f in os.listdir(dest)
+                    if os.path.isfile(os.path.join(dest, f))
+                ) if os.path.isdir(dest) else []
+                attached = self._ledger.attach_files(run_id, files)
+                names = ', '.join(os.path.basename(f) for f in files)
+                notes = f'run folder: {os.path.abspath(dest)}\nfiles: {names}'
+                if files and attached is None:
+                    notes += '\n(attaching files to ledger failed)'
+                self._ledger.update_run(run_id, outcome='success', notes=notes)
+            if self._ledger.available:
+                self.get_logger().info(
+                    f'ledger: closed run #{run.get("seq")} (id {run_id}) '
+                    f'in experiment #{self._ledger_experiment_id}')
+        except Exception as exc:
+            self.get_logger().warning(f'ledger update failed: {exc}')
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)
@@ -363,8 +475,11 @@ def main(args=None) -> None:
 
     exit_code = 0
     try:
+        # Best-effort and bounded by ledger_timeout_s; never raises.
+        node.ledger_register()
         ts = node.run_sequence()
-        m = node.report(ts)
+        m = node.report(ts)          # local files first, always
+        node.ledger_finish(m=m)      # then ledger; never raises
         trk = m['track']
         node.get_logger().info(
             f'DONE [{node._sp("config_name")}] track ({node._sp("track_shape")}): '
@@ -380,6 +495,7 @@ def main(args=None) -> None:
             node.get_logger().warning(
                 'failed before takeoff: not sending land/kill (the Crazyflie '
                 'was never commanded to fly)')
+        node.ledger_finish(error=str(exc))
         exit_code = 1
     finally:
         executor.shutdown()
