@@ -3,9 +3,10 @@
 
 Relaunches ``crazybridge controller_test.launch.py`` once per gain config,
 pausing for the operator between runs (hardware safety: swap battery, re-place
-the drone, check props). Each run writes ``<config>_metrics.*`` /
-``<config>_traj.npz`` into a shared ``--output-dir``; afterwards run
-``summarize.py`` on that directory for the comparison table + overlay.
+the drone, check props). Each run writes a ``<config>/`` folder (``metrics.json``,
+``metrics.csv``, ``traj.npz``, ``trajectory.csv``, ``pid.conf``) into a shared
+``--output-dir``; afterwards run ``summarize.py`` on that directory for the
+comparison table + overlay.
 
 Example
 -------
@@ -20,6 +21,11 @@ Example
 
 For a CrazySim dry run add:
     --launch-arg uri:=udp://127.0.0.1:19850 --launch-arg use_optitrack:=false
+
+The tracking trajectory is chosen with launch args, identical for every config:
+    --launch-arg track_shape:=figure8      # or spiral
+    --launch-arg track_peak_speed_mps:=1.0
+    --launch-arg track_timescale:=2.0      # first hardware flight: half speed
 """
 from __future__ import annotations
 
@@ -40,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         '--launch-arg', action='append', default=[], metavar='name:=value',
         help='Extra arg passed verbatim to ros2 launch (repeatable), e.g. '
-             'circle_duration_s:=10.0 or rerun_addr:=...')
+             'track_shape:=spiral, track_timescale:=2.0 or rerun_addr:=...')
     p.add_argument('--no-prompt', action='store_true',
                    help='Do not pause for the operator between runs (sim only!).')
     p.add_argument('--launch-file', default='controller_test.launch.py')

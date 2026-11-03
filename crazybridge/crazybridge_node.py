@@ -3,8 +3,9 @@
 Mirrors crazybridge.cpp: brings up a cflib link (defaulting to the CrazySim
 UDP URI), enables the high-level commander and Kalman estimator, streams
 position + quaternion as nav_msgs/Odometry, forwards mocap marker fixes via
-the external-position channel, and exposes takeoff/land/go_to services that
-drive the high-level commander.
+the external-position channel, and exposes takeoff/land/go_to/spiral services
+that drive the high-level commander, plus upload_trajectory/start_trajectory
+for polynomial trajectories stored in the Crazyflie's trajectory memory.
 """
 from __future__ import annotations
 
@@ -14,12 +15,15 @@ import threading
 
 import rclpy
 from time import sleep, time
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
+from cflib.crazyflie.mem import MemoryElement, Poly4D
 from logging import getLogger
 
 from ament_index_python.packages import get_package_share_directory
@@ -29,7 +33,8 @@ from std_srvs.srv import SetBool
 from geometry_msgs.msg import PointStamped, Vector3, Quaternion, PointStamped, Point
 from nav_msgs.msg import Odometry
 
-from crazybridge_interfaces.srv import GoTo, Land, Spiral, Takeoff
+from crazybridge_interfaces.srv import (
+    GoTo, Land, Spiral, StartTrajectory, Takeoff, UploadTrajectory)
 
 from crazybridge.interface import BridgePublishers, Create
 from crazybridge.pid_conf import PidConf
@@ -41,6 +46,12 @@ PARAM_ESTIMATOR = 'stabilizer.estimator'
 PARAM_CONTROLLER = 'stabilizer.controller'
 ESTIMATOR_KALMAN = 2
 ESTIMATOR_COMPLEMENTARY = 1
+
+# Firmware trajectory limits (crtp_commander_high_level.c): 4096 B of trajectory
+# memory / 132 B per raw poly4d piece = 31 pieces, and 31 trajectory slots.
+MAX_TRAJ_PIECES = 31
+NUM_TRAJ_SLOTS = 31
+TRAJ_COEFFS = 8   # degree-7 polynomial per axis
 
 # The ootParams gain names live in crazybridge.pid_conf.LAYOUT.
 
@@ -126,6 +137,18 @@ class CrazyBridge(Node):
             GoTo, Create.SRV_GOTO, self._goto_cb)
         self._spiral_srv = self.create_service(
             Spiral, Create.SRV_SPIRAL, self._spiral_cb)
+        # Uploading a trajectory blocks for seconds (hundreds of acknowledged
+        # radio packets). It gets its own callback group so that, under the
+        # MultiThreadedExecutor in main(), the mocap marker callback (which feeds
+        # extpos to the Kalman filter) and the safety timer keep running instead
+        # of being starved -- a 2 s marker gap would otherwise trigger the
+        # safety-landing path in _safety_check.
+        self._traj_group = MutuallyExclusiveCallbackGroup()
+        self._upload_traj_srv = self.create_service(
+            UploadTrajectory, Create.SRV_UPLOAD_TRAJ, self._upload_traj_cb,
+            callback_group=self._traj_group)
+        self._start_traj_srv = self.create_service(
+            StartTrajectory, Create.SRV_START_TRAJ, self._start_traj_cb)
         self._kill_srv = self.create_service(
             SetBool, Create.SRV_KILL, self._kill_cb)
 
@@ -658,6 +681,82 @@ class CrazyBridge(Node):
             response.message = str(exc)
         return response
 
+    def _upload_traj_cb(
+        self, request: UploadTrajectory.Request,
+        response: UploadTrajectory.Response
+    ) -> UploadTrajectory.Response:
+        n = len(request.pieces)
+        self.get_logger().info(
+            f'upload_trajectory id={request.trajectory_id} pieces={n} '
+            f'offset={request.piece_offset}'
+        )
+        try:
+            if request.piece_offset != 0:
+                raise ValueError(
+                    'piece_offset != 0 is not supported (the whole trajectory '
+                    'is rewritten on every upload)')
+            if not 1 <= n <= MAX_TRAJ_PIECES:
+                raise ValueError(
+                    f'{n} pieces; the firmware memory holds 1..{MAX_TRAJ_PIECES}')
+            if request.trajectory_id >= NUM_TRAJ_SLOTS:
+                raise ValueError(
+                    f'trajectory_id {request.trajectory_id} >= {NUM_TRAJ_SLOTS}')
+
+            polys = []
+            for i, piece in enumerate(request.pieces):
+                axes = [list(piece.poly_x), list(piece.poly_y),
+                        list(piece.poly_z), list(piece.poly_yaw)]
+                if any(len(c) != TRAJ_COEFFS for c in axes):
+                    raise ValueError(
+                        f'piece {i}: every poly_* needs {TRAJ_COEFFS} coefficients')
+                duration = self._duration_to_seconds(piece.duration)
+                if duration <= 0.0:
+                    raise ValueError(f'piece {i}: duration must be > 0')
+                polys.append(Poly4D(duration, *(Poly4D.Poly(c) for c in axes)))
+
+            mems = self._cf.mem.get_mems(MemoryElement.TYPE_TRAJ)
+            if not mems:
+                raise RuntimeError('Crazyflie exposes no trajectory memory')
+            mem = mems[0]
+            mem.trajectory = polys
+            if not mem.write_data_sync():
+                raise RuntimeError('trajectory memory write failed')
+            self._cf.high_level_commander.define_trajectory(
+                int(request.trajectory_id), 0, n)
+            self.get_logger().info(f'trajectory {request.trajectory_id} uploaded')
+            response.success = True
+            response.message = ''
+        except Exception as exc:
+            self.get_logger().error(f'upload_trajectory failed: {exc}')
+            response.success = False
+            response.message = str(exc)
+        return response
+
+    def _start_traj_cb(
+        self, request: StartTrajectory.Request,
+        response: StartTrajectory.Response
+    ) -> StartTrajectory.Response:
+        self.get_logger().info(
+            f'start_trajectory id={request.trajectory_id} '
+            f'timescale={request.timescale:.2f} relative={request.relative} '
+            f'reversed={request.reversed} group_mask={request.group_mask}'
+        )
+        try:
+            self._cf.high_level_commander.start_trajectory(
+                int(request.trajectory_id),
+                float(request.timescale),
+                relative_position=bool(request.relative),
+                reversed=bool(request.reversed),
+                group_mask=int(request.group_mask),
+            )
+            response.success = True
+            response.message = ''
+        except Exception as exc:
+            self.get_logger().error(f'start_trajectory failed: {exc}')
+            response.success = False
+            response.message = str(exc)
+        return response
+
     def shutdown(self) -> None:
         for name in (
             '_pos_log', '_q_log', '_setpoint_log',
@@ -676,11 +775,17 @@ class CrazyBridge(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = CrazyBridge()
+    # Multi-threaded so the (slow, blocking) trajectory upload can run in its own
+    # callback group without stalling marker/safety callbacks; everything else
+    # stays in the default mutually-exclusive group, i.e. serialised as before.
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.shutdown()
         node.destroy_node()
         if rclpy.ok():
