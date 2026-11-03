@@ -141,6 +141,40 @@ def flatten_row(config: str, metrics: dict) -> dict:
     return row
 
 
+# Units for ledger's numeric results, keyed by metric name (the part after the
+# segment). Matches the units scripts/summarize.py labels its headline metrics
+# with. Control-effort integrals are in raw firmware thrust units -> no unit.
+METRIC_UNITS = {
+    'duration_s': 's',
+    'int_thrust_abs': '', 'int_thrust_sq': '',
+    'int_torque_x_abs': 'N·m·s', 'int_torque_y_abs': 'N·m·s',
+    'int_torque_z_abs': 'N·m·s', 'int_torque_norm': 'N·m·s',
+    'int_torque_norm_sq': 'N²·m²·s',
+    'int_err_x_abs': 'm·s', 'int_err_y_abs': 'm·s', 'int_err_z_abs': 'm·s',
+    'int_err_norm': 'm·s',
+    'rmse_norm': 'm', 'max_err_norm': 'm',
+}
+
+# Absolute node-clock timestamps are not metrics; they only locate the window.
+_LEDGER_SKIP = ('t_start', 't_end')
+
+
+def ledger_results(metrics: dict) -> list[dict]:
+    """Flatten nested metrics into ledger ``{label, value, unit}`` results.
+
+    Labels are ``<segment>.<metric>``, the same keys as ``metrics.csv`` and
+    ``summarize.py``, so they line up across runs.
+    """
+    results = []
+    for seg_name, seg in metrics.items():
+        for key, value in seg.items():
+            if key in _LEDGER_SKIP:
+                continue
+            results.append({'label': f'{seg_name}.{key}', 'value': value,
+                            'unit': METRIC_UNITS.get(key, '')})
+    return results
+
+
 def run_dir(out_dir: str, config: str) -> str:
     """Directory holding one run's artefacts: ``<out_dir>/<config>/``."""
     return os.path.join(out_dir, config)

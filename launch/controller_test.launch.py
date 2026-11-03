@@ -32,6 +32,7 @@ from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -69,6 +70,19 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             'rerun_save_path', default_value='',
             description='Output .rrd path when rerun_mode=save.'),
+        DeclareLaunchArgument(
+            'ledger_enabled', default_value='true',
+            description='Register the run in ledger and upload its metrics and '
+                        'files. Best-effort: if ledger is not answering, the '
+                        'rest of the reporting continues normally.'),
+        DeclareLaunchArgument(
+            'ledger_url', default_value='',
+            description='Ledger API base URL (empty = $LEDGER_API_URL or '
+                        'http://127.0.0.1:4317). Token: $LEDGER_API_TOKEN.'),
+        DeclareLaunchArgument(
+            'ledger_experiment',
+            default_value='Crazyflie OOT Controller Comparison',
+            description='Ledger experiment to log runs into (created if missing).'),
         # Trajectory geometry / phase durations (kept identical across configs).
         DeclareLaunchArgument('takeoff_height_m', default_value='1.0'),
         DeclareLaunchArgument('goal_xyz', default_value='[0.5, 0.0, 1.0]'),
@@ -119,6 +133,10 @@ def generate_launch_description() -> LaunchDescription:
             'output_dir': LaunchConfiguration('output_dir'),
             # Same gain file the bridge loads; recorded with the metrics.
             'pid_conf_path': LaunchConfiguration('pid_conf_path'),
+            'ledger_enabled': ParameterValue(
+                LaunchConfiguration('ledger_enabled'), value_type=bool),
+            'ledger_url': LaunchConfiguration('ledger_url'),
+            'ledger_experiment': LaunchConfiguration('ledger_experiment'),
             'takeoff_height_m': LaunchConfiguration('takeoff_height_m'),
             'goal_xyz': LaunchConfiguration('goal_xyz'),
             'circle_radius_m': LaunchConfiguration('circle_radius_m'),
