@@ -69,17 +69,33 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             'rerun_save_path', default_value='',
             description='Output .rrd path when rerun_mode=save.'),
-        # Trajectory geometry / phase durations (kept identical across configs).
+        # Regulate point / phase durations (kept identical across configs).
         DeclareLaunchArgument('takeoff_height_m', default_value='1.0'),
         DeclareLaunchArgument('goal_xyz', default_value='[0.5, 0.0, 1.0]'),
-        DeclareLaunchArgument('circle_radius_m', default_value='0.5'),
         DeclareLaunchArgument('takeoff_duration_s', default_value='3.0'),
         DeclareLaunchArgument('settle_s', default_value='2.0'),
         DeclareLaunchArgument('goto_duration_s', default_value='3.0'),
         DeclareLaunchArgument('regulate_s', default_value='3.0'),
-        DeclareLaunchArgument('circle_duration_s', default_value='8.0'),
-        DeclareLaunchArgument('circle_settle_s', default_value='2.0'),
+        DeclareLaunchArgument('track_settle_s', default_value='2.0'),
         DeclareLaunchArgument('land_duration_s', default_value='3.0'),
+        # Tracking trajectory (uploaded polynomial; see crazybridge.trajectory).
+        DeclareLaunchArgument(
+            'track_shape', default_value='figure8',
+            description='figure8 (3D Lissajous) or spiral (expanding helix).'),
+        DeclareLaunchArgument('track_peak_speed_mps', default_value='1.0'),
+        DeclareLaunchArgument('track_laps', default_value='2'),
+        DeclareLaunchArgument('track_ramp_s', default_value='2.0'),
+        DeclareLaunchArgument(
+            'track_n_pieces', default_value='30',
+            description='Polynomial pieces; the firmware memory holds at most 31.'),
+        DeclareLaunchArgument(
+            'track_timescale', default_value='1.0',
+            description='>1 slows the trajectory (use 2.0 for a first hardware '
+                        'flight), <1 speeds it up.'),
+        DeclareLaunchArgument(
+            'figure8_amplitude_xyz', default_value='[0.6, 0.3, 0.3]'),
+        DeclareLaunchArgument('spiral_radius_m', default_value='0.8'),
+        DeclareLaunchArgument('spiral_ascent_m', default_value='0.4'),
     ]
 
     bridge = Node(
@@ -121,14 +137,21 @@ def generate_launch_description() -> LaunchDescription:
             'pid_conf_path': LaunchConfiguration('pid_conf_path'),
             'takeoff_height_m': LaunchConfiguration('takeoff_height_m'),
             'goal_xyz': LaunchConfiguration('goal_xyz'),
-            'circle_radius_m': LaunchConfiguration('circle_radius_m'),
             'takeoff_duration_s': LaunchConfiguration('takeoff_duration_s'),
             'settle_s': LaunchConfiguration('settle_s'),
             'goto_duration_s': LaunchConfiguration('goto_duration_s'),
             'regulate_s': LaunchConfiguration('regulate_s'),
-            'circle_duration_s': LaunchConfiguration('circle_duration_s'),
-            'circle_settle_s': LaunchConfiguration('circle_settle_s'),
+            'track_settle_s': LaunchConfiguration('track_settle_s'),
             'land_duration_s': LaunchConfiguration('land_duration_s'),
+            'track_shape': LaunchConfiguration('track_shape'),
+            'track_peak_speed_mps': LaunchConfiguration('track_peak_speed_mps'),
+            'track_laps': LaunchConfiguration('track_laps'),
+            'track_ramp_s': LaunchConfiguration('track_ramp_s'),
+            'track_n_pieces': LaunchConfiguration('track_n_pieces'),
+            'track_timescale': LaunchConfiguration('track_timescale'),
+            'figure8_amplitude_xyz': LaunchConfiguration('figure8_amplitude_xyz'),
+            'spiral_radius_m': LaunchConfiguration('spiral_radius_m'),
+            'spiral_ascent_m': LaunchConfiguration('spiral_ascent_m'),
         }],
     )
 
