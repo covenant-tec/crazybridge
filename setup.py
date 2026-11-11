@@ -23,7 +23,7 @@ setup(
     entry_points={
         'console_scripts': [
             'crazybridge = crazybridge.crazybridge_node:main',
-            'rerun = crazybridge.rerun:main',
+            'rerun_node = crazybridge.rerun_node:main',
             'crazybridge_tui = crazybridge.tui:main',
             'controller_test = crazybridge.controller_test:main',
         ],

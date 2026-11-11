@@ -73,6 +73,12 @@ class CrazyBridge(Node):
         self.declare_parameter('pid_conf_path', '')
         self.declare_parameter('load_pid_conf', True)
         self.declare_parameter('max_distance_from_origin', 3.0)
+        # Trajectory upload: per-attempt timeout for the memory write, number
+        # of attempts, and the extpos rate kept up while the upload has the
+        # radio link to itself (0 = pause extpos entirely).
+        self.declare_parameter('upload_attempt_timeout_s', 15.0)
+        self.declare_parameter('upload_attempts', 2)
+        self.declare_parameter('upload_extpos_hz', 10.0)
 
         self._uri = self.get_parameter(
             'uri').get_parameter_value().string_value
@@ -110,6 +116,16 @@ class CrazyBridge(Node):
         self._oot_pos_err = (0.0, 0.0, 0.0)
         self._oot_q_err = (0.0, 0.0, 0.0, 1.0)  # (x, y, z, w)
         self._oot_qd = (0.0, 0.0, 0.0, 1.0)     # (x, y, z, w)
+
+        self._upload_attempt_timeout_s = max(1.0, float(self.get_parameter(
+            'upload_attempt_timeout_s').get_parameter_value().double_value))
+        self._upload_attempts = max(1, int(self.get_parameter(
+            'upload_attempts').get_parameter_value().integer_value))
+        upload_hz = float(self.get_parameter(
+            'upload_extpos_hz').get_parameter_value().double_value)
+        self._upload_extpos_period = 1.0 / upload_hz if upload_hz > 0 else math.inf
+        self._upload_active = threading.Event()
+        self._last_extpos_sent = 0.0
 
         self._marker_id: int = None
         self._safe_to_fly: bool = False
@@ -326,11 +342,11 @@ class CrazyBridge(Node):
                 self._on_ang_vel_err_log
             )
 
-            self._input_log.start()
+           # self._input_log.start()
             self._pos_err_log.start()
-            self._q_err_log.start()
+           # self._q_err_log.start()
             self._qd_log.start()
-            self._ang_vel_err_log.start()
+           # self._ang_vel_err_log.start()
             self.get_logger().info('OOT log blocks started')
         except Exception as exc:
             self.get_logger().error(
@@ -394,6 +410,13 @@ class CrazyBridge(Node):
         self._last_seen_marker = time()
         self._bad_marker_counter = self._bad_marker_counter -1 if self._bad_marker_counter > 0 else 0
         if self._cf.connected:
+            if self._upload_active.is_set():
+                # A trajectory upload needs the radio link: send extpos at a
+                # reduced rate (or not at all) so the memory writes get through.
+                now = time()
+                if now - self._last_extpos_sent < self._upload_extpos_period:
+                    return
+                self._last_extpos_sent = now
             self._cf.extpos.send_extpos(point.x, point.y, point.z)
 
     def _safety_check(self):
@@ -681,6 +704,78 @@ class CrazyBridge(Node):
             response.message = str(exc)
         return response
 
+    # Log blocks that stream continuously; all are stopped during an upload and
+    # restarted afterwards (the OOT blocks run at 10 ms and saturate the link).
+    _STREAM_LOGS = (
+        '_pos_log', '_q_log', '_pm_log', '_setpoint_log',
+        '_input_log', '_pos_err_log', '_q_err_log', '_qd_log', '_ang_vel_err_log',
+    )
+
+    def _set_logs_running(self, running: bool) -> None:
+        for name in self._STREAM_LOGS:
+            log = getattr(self, name, None)
+            if log is None:
+                continue
+            try:
+                log.start() if running else log.stop()
+            except Exception as exc:
+                self.get_logger().warning(
+                    f'could not {"restart" if running else "stop"} {name}: {exc}')
+
+    def _write_traj_memory(self, mem) -> None:
+        """Write mem.trajectory to the Crazyflie with a bounded wait.
+
+        cflib's write_data_sync() waits on an Event with no timeout, so a lost
+        acknowledgement hangs the caller forever. Here every attempt is bounded;
+        streaming logs are stopped and extpos is throttled for the duration so
+        the memory chunks are not starved on the radio link.
+        """
+        self._upload_active.set()
+        self._set_logs_running(False)
+        try:
+            last_error = 'trajectory memory write failed'
+            for attempt in range(1, self._upload_attempts + 1):
+                done = threading.Event()
+                result = {'ok': False}
+
+                def finished(*_args, _r=result, _d=done):
+                    _r['ok'] = True
+                    _d.set()
+
+                def failed(*_args, _d=done):
+                    _d.set()
+
+                started = time()
+                mem.write_data(finished, write_failed_cb=failed)
+                if done.wait(timeout=self._upload_attempt_timeout_s):
+                    if result['ok']:
+                        self.get_logger().info(
+                            f'trajectory memory written in {time() - started:.2f} s '
+                            f'(attempt {attempt})')
+                        return
+                    last_error = 'trajectory memory write failed'
+                else:
+                    last_error = (
+                        f'trajectory memory write timed out after '
+                        f'{self._upload_attempt_timeout_s:.0f} s')
+                    # Drop the stalled request, otherwise the next write_data()
+                    # would queue behind it and never start.
+                    mem._write_finished_cb = None
+                    mem._write_failed_cb = None
+                    handler = self._cf.mem
+                    try:
+                        with handler._write_requests_lock:
+                            handler._write_requests[mem.id] = []
+                    except Exception as exc:
+                        self.get_logger().warning(
+                            f'could not clear stalled write request: {exc}')
+                self.get_logger().warning(
+                    f'{last_error} (attempt {attempt}/{self._upload_attempts})')
+            raise RuntimeError(last_error)
+        finally:
+            self._set_logs_running(True)
+            self._upload_active.clear()
+
     def _upload_traj_cb(
         self, request: UploadTrajectory.Request,
         response: UploadTrajectory.Response
@@ -719,8 +814,7 @@ class CrazyBridge(Node):
                 raise RuntimeError('Crazyflie exposes no trajectory memory')
             mem = mems[0]
             mem.trajectory = polys
-            if not mem.write_data_sync():
-                raise RuntimeError('trajectory memory write failed')
+            self._write_traj_memory(mem)
             self._cf.high_level_commander.define_trajectory(
                 int(request.trajectory_id), 0, n)
             self.get_logger().info(f'trajectory {request.trajectory_id} uploaded')

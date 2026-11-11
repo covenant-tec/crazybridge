@@ -1,0 +1,16 @@
+# Local rosdep rules for Python packages that are missing from, or too old in,
+# the official rosdistro database. Registered by scripts/setup_rosdep.sh.
+# This list sorts before the default one, so these rules take priority.
+python3-cflib:
+  ubuntu:
+    pip:
+      packages: [cflib]
+# apt's python3-textual on Ubuntu 22.04 is 0.1.13 (far too old), so use PyPI.
+python3-textual:
+  ubuntu:
+    pip:
+      packages: [textual]
+python3-rerun-sdk:
+  ubuntu:
+    pip:
+      packages: [rerun-sdk]

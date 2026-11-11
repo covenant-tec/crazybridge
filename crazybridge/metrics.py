@@ -163,14 +163,18 @@ METRIC_UNITS = {
 _LEDGER_SKIP = ('t_start', 't_end')
 
 
-def ledger_results(metrics: dict) -> list[dict]:
+def ledger_results(metrics: dict,
+                   segments: tuple[str, ...] | None = None) -> list[dict]:
     """Flatten nested metrics into ledger ``{label, value, unit}`` results.
 
     Labels are ``<segment>.<metric>``, the same keys as ``metrics.csv`` and
-    ``summarize.py``, so they line up across runs.
+    ``summarize.py``, so they line up across runs. ``segments`` restricts the
+    output to those segment names (default: all of them).
     """
     results = []
     for seg_name, seg in metrics.items():
+        if segments is not None and seg_name not in segments:
+            continue
         for key, value in seg.items():
             if key in _LEDGER_SKIP:
                 continue

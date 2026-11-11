@@ -1,4 +1,4 @@
-from rerun_sdk import rerun as rr
+import rerun as rr
 import rclpy
 import numpy as np
 from rclpy.node import Node
@@ -255,6 +255,14 @@ class Rerun(Node):
             )
             self._rerun_enabled = False
             return
+
+    def shutdown(self) -> None:
+        if getattr(self, '_rerun_enabled', False):
+            try:
+                rr.disconnect()
+            except Exception as exc:
+                self.get_logger().warning(f'rerun disconnect failed: {exc}')
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)

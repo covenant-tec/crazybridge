@@ -123,7 +123,7 @@ def generate_launch_description() -> LaunchDescription:
     )
 
     rerun = Node(
-        package='crazybridge', executable='rerun', name='rerun',
+        package='crazybridge', executable='rerun_node', name='rerun',
         output='screen',
         parameters=[{
             'rerun_mode': LaunchConfiguration('rerun_mode'),

@@ -94,7 +94,7 @@ def generate_launch_description() -> LaunchDescription:
         ),
         Node(
             package='crazybridge',
-            executable='rerun',
+            executable='rerun_node',
             name='rerun',
             output='screen',
             parameters=[{

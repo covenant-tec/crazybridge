@@ -31,8 +31,9 @@ in ``metrics.json`` so results are never orphaned from the gains behind them.
 
 Ledger: unless ``ledger_enabled`` is false, the run is also registered in the
 ledger experiment log (``ledger_experiment``) as a ``pending`` run before
-takeoff. On success its metrics are added as numeric results, every file in the
-run folder is attached and the outcome becomes ``success``; if the sequence
+takeoff. On success its ``total`` and ``track`` metrics (not the per-phase
+rest; those stay in ``metrics.json`` / ``metrics.csv``) are added as numeric
+results, every file in the run folder is attached and the outcome becomes ``success``; if the sequence
 fails the outcome becomes ``failure`` with the error in the notes. Ledger is
 strictly best-effort -- if it is down, slow or erroring, the flight, the local
 report files and the exit code are unaffected and only warnings are logged. The
@@ -67,6 +68,9 @@ from crazybridge import metrics, trajectory
 from crazybridge.interface import BridgeClientNode, Topics
 from crazybridge.ledger import LedgerClient
 from crazybridge.pid_conf import PidConf
+
+# Metric segments registered in ledger (full set stays in the local files).
+LEDGER_SEGMENTS = ('total', 'track')
 
 
 class ControllerTest(BridgeClientNode):
@@ -443,7 +447,11 @@ class ControllerTest(BridgeClientNode):
                     notes=f'test sequence failed: {error}')
             else:
                 if m is not None:
-                    self._ledger.add_results(run_id, metrics.ledger_results(m))
+                    # Only the headline segments go to ledger; the full
+                    # per-phase metrics stay in metrics.json / metrics.csv.
+                    self._ledger.add_results(
+                        run_id,
+                        metrics.ledger_results(m, segments=LEDGER_SEGMENTS))
                 dest = metrics.run_dir(self._sp('output_dir'),
                                        self._sp('config_name'))
                 files = sorted(

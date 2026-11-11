@@ -212,3 +212,13 @@ def test_ledger_results_labels_units_and_skips_timestamps():
     for seg in m.values():
         for k in seg:
             assert k in metrics.METRIC_UNITS or k in ('t_start', 't_end')
+
+
+def test_ledger_results_segment_filter():
+    ts = {'t_start': 0.0, 't_takeoff_end': 1.0, 't_regulate_end': 2.0,
+          't_track_end': 3.0, 't_land_end': 4.0}
+    m = metrics.compute_metrics({}, ts)
+    results = metrics.ledger_results(m, segments=('total', 'track'))
+    assert {r['label'].split('.')[0] for r in results} == {'total', 'track'}
+    expected = sum(len(m[s]) - 2 for s in ('total', 'track'))
+    assert len(results) == expected
