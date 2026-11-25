@@ -1,16 +1,92 @@
-# crazybridge
+# Crazybridge
 
-ROS 2 (Humble) bridge for Crazyflie drones. Requires the sibling package `crazybridge_interfaces`
-in the same workspace.
+ROS 2 bridge to fly the Bitcraze Crazyflie 2.X with OptiTrack motion capture.
 
-## Setup
+This package connects to the Crazyflie via Crazyradio, fusing external OptiTrack tracking data with the onboard state estimator. It exposes ROS 2 services for autonomous flight and publishes real-time odometry.
+
+This package runs inside the [crazyflie-optitrack](https://github.com/covenant-tec/crazyflie-optitrack) workspace.
+
+## Tracking Modes
+
+The bridge receives motion capture data from OptiTrack and forwards coordinates to the Crazyflie:
+
+* `rigid_body`: Uses 6-DoF position and orientation pose from `optitrack/rigid_body`.
+* `marker`: Uses 3-DoF position coordinates from `optitrack/marker`.
+* `auto`: Default mode. Automatically selects between rigid body and single marker based on the incoming OptiTrack stream.
+
+## Configuration Files
+
+Controller gains and vehicle mass are configured through the following files:
+
+* `config/pid.conf`: Tuned for single-marker flight with vehicle mass set to 0.029 kg.
+* `config/pid_rigid_body.conf`: Tuned for rigid-body flight with vehicle mass set to 0.037 kg.
+
+Each file contains 28 numeric values defining translational PID gains, translational homogeneous terms, rotational PID gains, rotational homogeneous terms, vehicle mass, and thrust/torque saturation limits.
+
+## Installation & Build
+
+Targets ROS 2 Humble. The sibling package `crazybridge_interfaces` must be in the same workspace.
+
+Install the dependencies either with rosdep (below) or, inside a Python virtual environment, with pip:
+
+```bash
+pip install -r requirements.txt
+```
+
+### Dependencies via rosdep
+
+`cflib` and `rerun-sdk` are only published on PyPI, and apt's `textual` is far too old, so
+`rosdep/local.yaml` maps `python3-cflib`, `python3-textual` and `python3-rerun-sdk` to pip packages.
+`scripts/setup_rosdep.sh` registers that file with rosdep on your machine:
 
 ```bash
 src/crazybridge/scripts/setup_rosdep.sh                    # once per machine, from the workspace root
 rosdep install --from-paths src --ignore-src -r -y
-colcon build
 ```
 
-`cflib` and `rerun-sdk` are only published on PyPI, and apt's `textual` is far too old, so
-`rosdep/local.yaml` maps `python3-cflib`, `python3-textual` and `python3-rerun-sdk` to pip packages; `scripts/setup_rosdep.sh`
-registers that file with rosdep on your machine.
+To compile the package within the ROS 2 workspace, navigate to the `src` directory and execute the build using Python's colcon module to ensure the active virtual environment is used:
+
+```bash
+cd ..
+python -m colcon build --symlink-install --packages-select crazybridge crazybridge_interfaces
+```
+
+## Running
+
+### Flight with OptiTrack
+
+```bash
+ros2 launch crazybridge crazyoptitrack.launch.py
+```
+
+If run without arguments, the launch file executes with default parameters:
+* Connects to radio address `radio://0/80/2M/E7E7E7E7E7`
+* Runs in `auto` mode
+* Loads `config/pid.conf` or `config/pid_rigid_body.conf` automatically
+* Opens a Rerun visualization window
+
+To override the default address or tracking mode:
+
+```bash
+ros2 launch crazybridge crazyoptitrack.launch.py tracking_mode:=rigid_body uri:=<your-crazyflie-uri>
+```
+
+### Automated Benchmark Test
+
+Flies an automated test sequence consisting of takeoff, position hold, tracking of an uploaded figure-8 / spiral trajectory, and landing, saving trajectory data and performance metrics to the specified output folder (and, best-effort, registering the run in the ledger experiment log):
+
+```bash
+ros2 launch crazybridge controller_test.launch.py output_dir:=/tmp/ctrl_test
+```
+
+### Terminal Dashboard
+
+Opens an interactive terminal interface to trigger takeoff, landing, or emergency motor shutdown:
+
+```bash
+ros2 run crazybridge crazybridge_tui
+```
+
+## Credits
+
+The core software architecture, ROS 2 bridge implementation, controller testing framework, and OptiTrack motion capture integration were designed and developed by [Kevin Martinez](https://github.com/Fairbrook) as part of doctoral research.

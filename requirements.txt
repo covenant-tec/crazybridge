@@ -1,0 +1,6 @@
+cflib
+rerun-sdk
+textual
+numpy
+scipy
+matplotlib

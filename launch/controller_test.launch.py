@@ -36,24 +36,23 @@ from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description() -> LaunchDescription:
-    default_pid_conf = os.path.join(
-        get_package_share_directory('crazybridge'), 'config', 'pid.conf'
-    )
-
     args = [
         DeclareLaunchArgument(
             'config_name', default_value='default',
             description='Label for this run; names the output folder and the '
                         'rerun recording.'),
         DeclareLaunchArgument(
-            'pid_conf_path', default_value=default_pid_conf,
-            description='OOT gain file to load for this run.'),
+            'tracking_mode', default_value='auto',
+            description="Mocap tracking mode: 'rigid_body' (6-DoF), 'marker' (single-ball 3-DoF), or 'auto'."),
+        DeclareLaunchArgument(
+            'pid_conf_path', default_value='',
+            description='OOT gain file to load for this run (empty = auto-resolve based on tracking_mode).'),
         DeclareLaunchArgument(
             'output_dir', default_value='/tmp/ctrl_test',
             description='Parent directory; this run writes into '
                         '<output_dir>/<config_name>/.'),
         DeclareLaunchArgument(
-            'uri', default_value='radio://0/100/2M',
+            'uri', default_value='radio://0/80/2M/E7E7E7E7E7',
             description='cflib URI (hardware default; sim = udp://127.0.0.1:19850).'),
         DeclareLaunchArgument(
             'use_optitrack', default_value='true',
@@ -117,6 +116,7 @@ def generate_launch_description() -> LaunchDescription:
         output='screen',
         parameters=[{
             'uri': LaunchConfiguration('uri'),
+            'tracking_mode': LaunchConfiguration('tracking_mode'),
             'pid_conf_path': LaunchConfiguration('pid_conf_path'),
             'load_pid_conf': True,
         }],
@@ -149,6 +149,7 @@ def generate_launch_description() -> LaunchDescription:
             'output_dir': LaunchConfiguration('output_dir'),
             # Same gain file the bridge loads; recorded with the metrics.
             'pid_conf_path': LaunchConfiguration('pid_conf_path'),
+            'tracking_mode': LaunchConfiguration('tracking_mode'),
             'ledger_enabled': ParameterValue(
                 LaunchConfiguration('ledger_enabled'), value_type=bool),
             'ledger_url': LaunchConfiguration('ledger_url'),
