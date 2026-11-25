@@ -8,14 +8,15 @@ they are easy to test and reuse. Sample arrays are laid out as:
 * ``pos_err`` -> shape (N, 4): columns ``[t, ex, ey, ez]``
 
 Timestamps are seconds (any consistent clock). Integrals are trapezoidal.
-The headline comparison numbers are the *circle* phase ``int_thrust_abs`` /
+The headline comparison numbers are the *track* phase ``int_thrust_abs`` /
 ``int_torque_norm`` (control effort) and ``int_err_norm`` (tracking error).
 
 :func:`write_reports` lays a run out as::
 
-    <output_dir>/<config_name>/metrics.json   # metrics + the gains flown
+    <output_dir>/<config_name>/metrics.json   # metrics + the gains flown + trajectory spec/stats
                               /metrics.csv
-                              /traj.npz
+                              /traj.npz       # odom, setpoint, analytic reference, ...
+                              /trajectory.csv # the polynomial pieces that were uploaded
                               /pid.conf       # verbatim copy of the gain file
 """
 from __future__ import annotations
@@ -27,12 +28,15 @@ import shutil
 
 import numpy as np
 
+from crazybridge import trajectory
+
 # Each run gets its own ``<output_dir>/<config_name>/`` folder, and the files
 # inside are named identically across runs so tooling never has to interpolate
 # the config name into a filename.
 FILE_METRICS_JSON = 'metrics.json'
 FILE_METRICS_CSV = 'metrics.csv'
 FILE_TRAJ_NPZ = 'traj.npz'
+FILE_TRAJECTORY_CSV = 'trajectory.csv'
 FILE_PID_CONF = 'pid.conf'
 FILE_TELEMETRY_CSV = 'flight_telemetry.csv'
 
@@ -47,8 +51,8 @@ except ImportError:  # numpy < 2.0
 SEGMENTS = (
     ('takeoff', 't_start', 't_takeoff_end'),
     ('regulate', 't_takeoff_end', 't_regulate_end'),
-    ('circle', 't_regulate_end', 't_circle_end'),
-    ('land', 't_circle_end', 't_land_end'),
+    ('track', 't_regulate_end', 't_track_end'),
+    ('land', 't_track_end', 't_land_end'),
     ('total', 't_start', 't_land_end'),
 )
 
@@ -140,6 +144,44 @@ def flatten_row(config: str, metrics: dict) -> dict:
         for k, v in seg.items():
             row[f'{seg_name}.{k}'] = v
     return row
+
+
+# Units for ledger's numeric results, keyed by metric name (the part after the
+# segment). Matches the units scripts/summarize.py labels its headline metrics
+# with. Control-effort integrals are in raw firmware thrust units -> no unit.
+METRIC_UNITS = {
+    'duration_s': 's',
+    'int_thrust_abs': '', 'int_thrust_sq': '',
+    'int_torque_x_abs': 'N·m·s', 'int_torque_y_abs': 'N·m·s',
+    'int_torque_z_abs': 'N·m·s', 'int_torque_norm': 'N·m·s',
+    'int_torque_norm_sq': 'N²·m²·s',
+    'int_err_x_abs': 'm·s', 'int_err_y_abs': 'm·s', 'int_err_z_abs': 'm·s',
+    'int_err_norm': 'm·s',
+    'rmse_norm': 'm', 'max_err_norm': 'm',
+}
+
+# Absolute node-clock timestamps are not metrics; they only locate the window.
+_LEDGER_SKIP = ('t_start', 't_end')
+
+
+def ledger_results(metrics: dict,
+                   segments: tuple[str, ...] | None = None) -> list[dict]:
+    """Flatten nested metrics into ledger ``{label, value, unit}`` results.
+
+    Labels are ``<segment>.<metric>``, the same keys as ``metrics.csv`` and
+    ``summarize.py``, so they line up across runs. ``segments`` restricts the
+    output to those segment names (default: all of them).
+    """
+    results = []
+    for seg_name, seg in metrics.items():
+        if segments is not None and seg_name not in segments:
+            continue
+        for key, value in seg.items():
+            if key in _LEDGER_SKIP:
+                continue
+            results.append({'label': f'{seg_name}.{key}', 'value': value,
+                            'unit': METRIC_UNITS.get(key, '')})
+    return results
 
 
 def run_dir(out_dir: str, config: str) -> str:
@@ -278,6 +320,14 @@ def write_reports(
     os.makedirs(dest, exist_ok=True)
 
     report = {"config": config, "timestamps": ts, "metrics": metrics}
+    if "spec" in traj:
+        # Spec + achieved peak speed/accel/extent/fit error, so the tracking
+        # difficulty is recorded next to the numbers it produced.
+        report["trajectory"] = {
+            "spec": traj["spec"],
+            "timescale": float(traj.get("timescale", 1.0)),
+            "stats": traj.get("stats", {}),
+        }
     if gains is not None:
         report["gains"] = gains
     if pid_conf_path:
@@ -308,14 +358,22 @@ def write_reports(
         torque=torque,
         pos_err=pos_err,
         goal=np.asarray(traj.get("goal", [0.0, 0.0, 0.0]), dtype=float),
-        radius=float(traj.get("radius", 0.0)),
-        clockwise=bool(traj.get("clockwise", False)),
+        # Analytic reference path [t, x, y, z] on the same clock as odom/setpoint.
+        reference=np.asarray(traj.get("reference", np.empty((0, 4))), dtype=float),
+        shape=str(traj.get("shape", "")),
+        spec_json=json.dumps(traj.get("spec", {})),
+        timescale=float(traj.get("timescale", 1.0)),
         t_start=float(ts["t_start"]),
         t_land_end=float(ts["t_land_end"]),
+        t_track_start=float(ts.get("t_track_start", ts["t_regulate_end"])),
+        t_track_end=float(ts["t_track_end"]),
     )
 
     # Export synchronized 50 Hz telemetry table to CSV
     write_telemetry_csv(dest, ts, traj, samples, dt=0.02)
+
+    if "pieces" in traj:
+        trajectory.to_csv(os.path.join(dest, FILE_TRAJECTORY_CSV), traj["pieces"])
 
     # Copy the gain file itself, so the run folder is self-contained even if the
     # source pid.conf is later edited in place.
@@ -323,23 +381,3 @@ def write_reports(
         shutil.copyfile(pid_conf_path, os.path.join(dest, FILE_PID_CONF))
 
     return row
-
-
-def ideal_circle(goal, radius: float, clockwise: bool, n: int = 180) -> np.ndarray:
-    """The circle the built-in non-sideways spiral traces from `goal`, yaw 0.
-
-    Mirrors ``plan_spiral_from`` in the firmware planner: for a forward spiral
-    the centre sits at ``goal + sense * radius * (sin psi, -cos psi)`` with
-    yaw psi = 0, i.e. offset by ``sense * radius`` along -y (sense = +1 CW,
-    -1 CCW). The flown path is that circle in the ``z = goal.z`` plane.
-    """
-    goal = np.asarray(goal, dtype=float)
-    sense = 1.0 if clockwise else -1.0
-    cx, cy, cz = goal[0], goal[1] - sense * radius, goal[2]
-    # Start angle so the curve begins exactly at `goal`.
-    start = np.arctan2(goal[0] - cx, -(goal[1] - cy))
-    sweep = -sense * np.linspace(0.0, 2 * np.pi, n)
-    px = cx + radius * np.sin(start + sweep)
-    py = cy - radius * np.cos(start + sweep)
-    pz = np.full(n, cz)
-    return np.column_stack([px, py, pz])

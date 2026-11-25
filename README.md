@@ -25,10 +25,23 @@ Each file contains 28 numeric values defining translational PID gains, translati
 
 ## Installation & Build
 
-Activate the Python virtual environment and install the required dependencies:
+Targets ROS 2 Humble. The sibling package `crazybridge_interfaces` must be in the same workspace.
+
+Install the dependencies either with rosdep (below) or, inside a Python virtual environment, with pip:
 
 ```bash
 pip install -r requirements.txt
+```
+
+### Dependencies via rosdep
+
+`cflib` and `rerun-sdk` are only published on PyPI, and apt's `textual` is far too old, so
+`rosdep/local.yaml` maps `python3-cflib`, `python3-textual` and `python3-rerun-sdk` to pip packages.
+`scripts/setup_rosdep.sh` registers that file with rosdep on your machine:
+
+```bash
+src/crazybridge/scripts/setup_rosdep.sh                    # once per machine, from the workspace root
+rosdep install --from-paths src --ignore-src -r -y
 ```
 
 To compile the package within the ROS 2 workspace, navigate to the `src` directory and execute the build using Python's colcon module to ensure the active virtual environment is used:
@@ -60,7 +73,7 @@ ros2 launch crazybridge crazyoptitrack.launch.py tracking_mode:=rigid_body uri:=
 
 ### Automated Benchmark Test
 
-Flies an automated test sequence consisting of takeoff, position hold, circular trajectory tracking, and landing, saving trajectory data and performance metrics to the specified output folder:
+Flies an automated test sequence consisting of takeoff, position hold, tracking of an uploaded figure-8 / spiral trajectory, and landing, saving trajectory data and performance metrics to the specified output folder (and, best-effort, registering the run in the ledger experiment log):
 
 ```bash
 ros2 launch crazybridge controller_test.launch.py output_dir:=/tmp/ctrl_test

@@ -56,7 +56,7 @@ def generate_launch_description() -> LaunchDescription:
     )
     rerun_addr_arg = DeclareLaunchArgument(
         "rerun_addr",
-        default_value="rerun+http://10.242.79.176:9876/proxy",
+        default_value="rerun+http://10.242.14.161:9876/proxy",
         description="gRPC address for rerun_mode=connect (empty = default).",
     )
     rerun_save_path_arg = DeclareLaunchArgument(
@@ -103,7 +103,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             Node(
                 package="crazybridge",
-                executable="rerun",
+                executable="rerun_node",
                 name="rerun",
                 output="screen",
                 parameters=[

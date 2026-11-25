@@ -3,8 +3,9 @@
 Mirrors crazybridge.cpp: brings up a cflib link (defaulting to the CrazySim
 UDP URI), enables the high-level commander and Kalman estimator, streams
 position + quaternion as nav_msgs/Odometry, forwards mocap marker/rigid-body fixes
-via the external-position channel, and exposes takeoff/land/go_to services that
-drive the high-level commander.
+via the external-position channel, and exposes takeoff/land/go_to/spiral services
+that drive the high-level commander, plus upload_trajectory/start_trajectory
+for polynomial trajectories stored in the Crazyflie's trajectory memory.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import rclpy
 from ament_index_python.packages import get_package_share_directory
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
+from cflib.crazyflie.mem import MemoryElement, Poly4D
 from geometry_msgs.msg import (
     Point,
     PointStamped,
@@ -29,6 +31,8 @@ from geometry_msgs.msg import (
     Vector3,
 )
 from nav_msgs.msg import Odometry
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Imu
@@ -37,7 +41,14 @@ from std_srvs.srv import SetBool
 
 from crazybridge.interface import BridgePublishers, Create, TrackingMode
 from crazybridge.pid_conf import PidConf
-from crazybridge_interfaces.srv import GoTo, Land, Spiral, Takeoff
+from crazybridge_interfaces.srv import (
+    GoTo,
+    Land,
+    Spiral,
+    StartTrajectory,
+    Takeoff,
+    UploadTrajectory,
+)
 
 logger = getLogger()
 
@@ -46,6 +57,12 @@ PARAM_ESTIMATOR = "stabilizer.estimator"
 PARAM_CONTROLLER = "stabilizer.controller"
 ESTIMATOR_KALMAN = 2
 ESTIMATOR_COMPLEMENTARY = 1
+
+# Firmware trajectory limits (crtp_commander_high_level.c): 4096 B of trajectory
+# memory / 132 B per raw poly4d piece = 31 pieces, and 31 trajectory slots.
+MAX_TRAJ_PIECES = 31
+NUM_TRAJ_SLOTS = 31
+TRAJ_COEFFS = 8   # degree-7 polynomial per axis
 
 # The ootParams gain names live in crazybridge.pid_conf.LAYOUT.
 
@@ -71,6 +88,12 @@ class CrazyBridge(Node):
         self.declare_parameter("tracking_mode", TrackingMode.RIGID_BODY)
         self.declare_parameter("rigid_body_id", "")
         self.declare_parameter("marker_id", "")
+        # Trajectory upload: per-attempt timeout for the memory write, number
+        # of attempts, and the extpos rate kept up while the upload has the
+        # radio link to itself (0 = pause extpos entirely).
+        self.declare_parameter("upload_attempt_timeout_s", 15.0)
+        self.declare_parameter("upload_attempts", 2)
+        self.declare_parameter("upload_extpos_hz", 10.0)
 
         self._uri = self.get_parameter("uri").get_parameter_value().string_value
         self._log_period_ms = self._sanitise_log_period(
@@ -151,6 +174,29 @@ class CrazyBridge(Node):
         self._oot_q_err = (0.0, 0.0, 0.0, 1.0)  # (x, y, z, w)
         self._oot_qd = (0.0, 0.0, 0.0, 1.0)  # (x, y, z, w)
 
+        self._upload_attempt_timeout_s = max(
+            1.0,
+            float(
+                self.get_parameter("upload_attempt_timeout_s")
+                .get_parameter_value()
+                .double_value
+            ),
+        )
+        self._upload_attempts = max(
+            1,
+            int(
+                self.get_parameter("upload_attempts")
+                .get_parameter_value()
+                .integer_value
+            ),
+        )
+        upload_hz = float(
+            self.get_parameter("upload_extpos_hz").get_parameter_value().double_value
+        )
+        self._upload_extpos_period = 1.0 / upload_hz if upload_hz > 0 else math.inf
+        self._upload_active = threading.Event()
+        self._last_extpos_sent = 0.0
+
         self._safe_to_fly: bool = False
         self._bad_mocap_counter: int = 0
         self._last_seen_rigid_body: float = 0.0
@@ -190,6 +236,22 @@ class CrazyBridge(Node):
         self._goto_srv = self.create_service(GoTo, Create.SRV_GOTO, self._goto_cb)
         self._spiral_srv = self.create_service(
             Spiral, Create.SRV_SPIRAL, self._spiral_cb
+        )
+        # Uploading a trajectory blocks for seconds (hundreds of acknowledged
+        # radio packets). It gets its own callback group so that, under the
+        # MultiThreadedExecutor in main(), the mocap callbacks (which feed
+        # extpos to the Kalman filter) and the safety timer keep running instead
+        # of being starved -- a 2 s mocap gap would otherwise trigger the
+        # safety-landing path in _safety_check.
+        self._traj_group = MutuallyExclusiveCallbackGroup()
+        self._upload_traj_srv = self.create_service(
+            UploadTrajectory,
+            Create.SRV_UPLOAD_TRAJ,
+            self._upload_traj_cb,
+            callback_group=self._traj_group,
+        )
+        self._start_traj_srv = self.create_service(
+            StartTrajectory, Create.SRV_START_TRAJ, self._start_traj_cb
         )
         self._kill_srv = self.create_service(SetBool, Create.SRV_KILL, self._kill_cb)
 
@@ -422,11 +484,11 @@ class CrazyBridge(Node):
                 self._on_ang_vel_err_log
             )
 
-            self._input_log.start()
+           # self._input_log.start()
             self._pos_err_log.start()
-            self._q_err_log.start()
+           # self._q_err_log.start()
             self._qd_log.start()
-            self._ang_vel_err_log.start()
+            # self._ang_vel_err_log.start()
             self.get_logger().info("OOT log blocks started")
         except Exception as exc:
             self.get_logger().error(f"Failed to register OOT log blocks: {exc}")
@@ -472,6 +534,22 @@ class CrazyBridge(Node):
 
     def _on_disconnected(self, link_uri: str) -> None:
         self.get_logger().info(f"Disconnected from {link_uri}")
+
+    def _extpos_due(self) -> bool:
+        """Whether this mocap fix should be forwarded to the Crazyflie.
+
+        A trajectory upload needs the radio link, so while one is active extpos
+        is sent at a reduced rate (or not at all). Mocap bookkeeping (last-seen,
+        bad-fix counter) still runs on every callback, so the safety timer is
+        unaffected.
+        """
+        if not self._upload_active.is_set():
+            return True
+        now = time()
+        if now - self._last_extpos_sent < self._upload_extpos_period:
+            return False
+        self._last_extpos_sent = now
+        return True
 
     def _rigid_body_cb(self, msg: PoseStamped) -> None:
         header: Header = msg.header
@@ -520,7 +598,7 @@ class CrazyBridge(Node):
                 except Exception as exc:
                     self.get_logger().error(f"Failed to apply auto-detected PID conf: {exc}")
 
-        if self._cf.is_connected():
+        if self._cf.is_connected() and self._extpos_due():
             self._cf.extpos.send_extpose(
                 pos.x, pos.y, pos.z, orie.x, orie.y, orie.z, orie.w
             )
@@ -574,7 +652,7 @@ class CrazyBridge(Node):
                 except Exception as exc:
                     self.get_logger().error(f"Failed to apply auto-detected PID conf: {exc}")
 
-        if self._cf.is_connected():
+        if self._cf.is_connected() and self._extpos_due():
             self._cf.extpos.send_extpos(pt.x, pt.y, pt.z)
 
     def _safety_check(self) -> None:
@@ -883,6 +961,153 @@ class CrazyBridge(Node):
             response.message = str(exc)
         return response
 
+    # Log blocks that stream continuously; all are stopped during an upload and
+    # restarted afterwards (the OOT blocks run at 10 ms and saturate the link).
+    _STREAM_LOGS = (
+        '_pos_log', '_q_log', '_pm_log', '_setpoint_log',
+        '_input_log', '_pos_err_log', '_q_err_log', '_qd_log', '_ang_vel_err_log',
+    )
+
+    def _set_logs_running(self, running: bool) -> None:
+        for name in self._STREAM_LOGS:
+            log = getattr(self, name, None)
+            if log is None:
+                continue
+            try:
+                log.start() if running else log.stop()
+            except Exception as exc:
+                self.get_logger().warning(
+                    f'could not {"restart" if running else "stop"} {name}: {exc}')
+
+    def _write_traj_memory(self, mem) -> None:
+        """Write mem.trajectory to the Crazyflie with a bounded wait.
+
+        cflib's write_data_sync() waits on an Event with no timeout, so a lost
+        acknowledgement hangs the caller forever. Here every attempt is bounded;
+        streaming logs are stopped and extpos is throttled for the duration so
+        the memory chunks are not starved on the radio link.
+        """
+        self._upload_active.set()
+        self._set_logs_running(False)
+        try:
+            last_error = 'trajectory memory write failed'
+            for attempt in range(1, self._upload_attempts + 1):
+                done = threading.Event()
+                result = {'ok': False}
+
+                def finished(*_args, _r=result, _d=done):
+                    _r['ok'] = True
+                    _d.set()
+
+                def failed(*_args, _d=done):
+                    _d.set()
+
+                started = time()
+                mem.write_data(finished, write_failed_cb=failed)
+                if done.wait(timeout=self._upload_attempt_timeout_s):
+                    if result['ok']:
+                        self.get_logger().info(
+                            f'trajectory memory written in {time() - started:.2f} s '
+                            f'(attempt {attempt})')
+                        return
+                    last_error = 'trajectory memory write failed'
+                else:
+                    last_error = (
+                        f'trajectory memory write timed out after '
+                        f'{self._upload_attempt_timeout_s:.0f} s')
+                    # Drop the stalled request, otherwise the next write_data()
+                    # would queue behind it and never start.
+                    mem._write_finished_cb = None
+                    mem._write_failed_cb = None
+                    handler = self._cf.mem
+                    try:
+                        with handler._write_requests_lock:
+                            handler._write_requests[mem.id] = []
+                    except Exception as exc:
+                        self.get_logger().warning(
+                            f'could not clear stalled write request: {exc}')
+                self.get_logger().warning(
+                    f'{last_error} (attempt {attempt}/{self._upload_attempts})')
+            raise RuntimeError(last_error)
+        finally:
+            self._set_logs_running(True)
+            self._upload_active.clear()
+
+    def _upload_traj_cb(
+        self, request: UploadTrajectory.Request,
+        response: UploadTrajectory.Response
+    ) -> UploadTrajectory.Response:
+        n = len(request.pieces)
+        self.get_logger().info(
+            f'upload_trajectory id={request.trajectory_id} pieces={n} '
+            f'offset={request.piece_offset}'
+        )
+        try:
+            if request.piece_offset != 0:
+                raise ValueError(
+                    'piece_offset != 0 is not supported (the whole trajectory '
+                    'is rewritten on every upload)')
+            if not 1 <= n <= MAX_TRAJ_PIECES:
+                raise ValueError(
+                    f'{n} pieces; the firmware memory holds 1..{MAX_TRAJ_PIECES}')
+            if request.trajectory_id >= NUM_TRAJ_SLOTS:
+                raise ValueError(
+                    f'trajectory_id {request.trajectory_id} >= {NUM_TRAJ_SLOTS}')
+
+            polys = []
+            for i, piece in enumerate(request.pieces):
+                axes = [list(piece.poly_x), list(piece.poly_y),
+                        list(piece.poly_z), list(piece.poly_yaw)]
+                if any(len(c) != TRAJ_COEFFS for c in axes):
+                    raise ValueError(
+                        f'piece {i}: every poly_* needs {TRAJ_COEFFS} coefficients')
+                duration = self._duration_to_seconds(piece.duration)
+                if duration <= 0.0:
+                    raise ValueError(f'piece {i}: duration must be > 0')
+                polys.append(Poly4D(duration, *(Poly4D.Poly(c) for c in axes)))
+
+            mems = self._cf.mem.get_mems(MemoryElement.TYPE_TRAJ)
+            if not mems:
+                raise RuntimeError('Crazyflie exposes no trajectory memory')
+            mem = mems[0]
+            mem.trajectory = polys
+            self._write_traj_memory(mem)
+            self._cf.high_level_commander.define_trajectory(
+                int(request.trajectory_id), 0, n)
+            self.get_logger().info(f'trajectory {request.trajectory_id} uploaded')
+            response.success = True
+            response.message = ''
+        except Exception as exc:
+            self.get_logger().error(f'upload_trajectory failed: {exc}')
+            response.success = False
+            response.message = str(exc)
+        return response
+
+    def _start_traj_cb(
+        self, request: StartTrajectory.Request,
+        response: StartTrajectory.Response
+    ) -> StartTrajectory.Response:
+        self.get_logger().info(
+            f'start_trajectory id={request.trajectory_id} '
+            f'timescale={request.timescale:.2f} relative={request.relative} '
+            f'reversed={request.reversed} group_mask={request.group_mask}'
+        )
+        try:
+            self._cf.high_level_commander.start_trajectory(
+                int(request.trajectory_id),
+                float(request.timescale),
+                relative_position=bool(request.relative),
+                reversed=bool(request.reversed),
+                group_mask=int(request.group_mask),
+            )
+            response.success = True
+            response.message = ''
+        except Exception as exc:
+            self.get_logger().error(f'start_trajectory failed: {exc}')
+            response.success = False
+            response.message = str(exc)
+        return response
+
     def shutdown(self) -> None:
         for name in (
             "_pos_log",
@@ -907,11 +1132,17 @@ class CrazyBridge(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = CrazyBridge()
+    # Multi-threaded so the (slow, blocking) trajectory upload can run in its own
+    # callback group without stalling marker/safety callbacks; everything else
+    # stays in the default mutually-exclusive group, i.e. serialised as before.
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.shutdown()
         node.destroy_node()
         if rclpy.ok():
