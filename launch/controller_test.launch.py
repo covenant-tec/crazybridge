@@ -59,6 +59,12 @@ def generate_launch_description() -> LaunchDescription:
             'ekf_reconn_skip', default_value='false',
             description='Skip decision trigger on the first OptiTrack sample after a dropout (true/false).'),
         DeclareLaunchArgument(
+            'imu_log_period_ms', default_value='20',
+            description='Period in ms for the body-frame IMU CRTP log block (20 ms = 50 Hz).'),
+        DeclareLaunchArgument(
+            'bias_log_period_ms', default_value='500',
+            description='Period in ms for the stationary IMU bias CRTP log block (500 ms = 2 Hz).'),
+        DeclareLaunchArgument(
             'pid_conf_path', default_value='',
             description='OOT gain file to load for this run (empty = auto-resolve based on tracking_mode).'),
         DeclareLaunchArgument(
@@ -107,6 +113,8 @@ def generate_launch_description() -> LaunchDescription:
             'adapt_conf_path': LaunchConfiguration('adapt_conf_path'),
             'ekf_enable_clamp': LaunchConfiguration('ekf_enable_clamp'),
             'ekf_reconn_skip': LaunchConfiguration('ekf_reconn_skip'),
+            'imu_log_period_ms': LaunchConfiguration('imu_log_period_ms'),
+            'bias_log_period_ms': LaunchConfiguration('bias_log_period_ms'),
             'pid_conf_path': LaunchConfiguration('pid_conf_path'),
             'load_pid_conf': True,
         }],

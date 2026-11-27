@@ -57,6 +57,16 @@ def generate_launch_description() -> LaunchDescription:
         default_value="100",
         description="Period in ms for the OOT debug log blocks.",
     )
+    imu_log_period_arg = DeclareLaunchArgument(
+        "imu_log_period_ms",
+        default_value="20",
+        description="Period in ms for the body-frame IMU log block (20 ms = 50 Hz).",
+    )
+    bias_log_period_arg = DeclareLaunchArgument(
+        "bias_log_period_ms",
+        default_value="500",
+        description="Period in ms for the stationary IMU bias log block (500 ms = 2 Hz).",
+    )
     pid_conf_arg = DeclareLaunchArgument(
         "pid_conf_path",
         default_value="",
@@ -109,6 +119,8 @@ def generate_launch_description() -> LaunchDescription:
             uri_arg,
             log_period_arg,
             oot_log_period_arg,
+            imu_log_period_arg,
+            bias_log_period_arg,
             pid_conf_arg,
             load_pid_conf_arg,
             rerun_mode_arg,
@@ -131,6 +143,8 @@ def generate_launch_description() -> LaunchDescription:
                         "ekf_reconn_skip": LaunchConfiguration("ekf_reconn_skip"),
                         "log_period_ms": LaunchConfiguration("log_period_ms"),
                         "oot_log_period_ms": LaunchConfiguration("oot_log_period_ms"),
+                        "imu_log_period_ms": LaunchConfiguration("imu_log_period_ms"),
+                        "bias_log_period_ms": LaunchConfiguration("bias_log_period_ms"),
                         "pid_conf_path": LaunchConfiguration("pid_conf_path"),
                         "load_pid_conf": LaunchConfiguration("load_pid_conf"),
                     }
