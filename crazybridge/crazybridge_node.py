@@ -14,9 +14,10 @@ import math
 import os
 import threading
 from logging import getLogger
-from time import sleep, time
+from time import monotonic, sleep, time
 
 import cflib.crtp
+from cflib.crtp.crtpstack import CRTPPacket
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from cflib.crazyflie import Crazyflie
@@ -69,6 +70,31 @@ STILLNESS_MAX_TILT_ACC_MPS2 = 1.50
 STILLNESS_WINDOW_SAMPLES = 25
 STILLNESS_MIN_SAMPLES = 5
 STILLNESS_MAX_AGE_S = 1.0
+
+# Keepalive & MCU reboot/telemetry-stall recovery constants:
+# - CRTP_PORT_LINK (0x0F) channel linkSink (0x02) is silently consumed by
+#   crtpservice.c with zero downlink traffic while refreshing radiolink.c
+#   `lastPacketTick` (< 1000 ms) when OptiTrack is idle on bench.
+#   Port/channel must be set with CRTPPacket.set_header(): cflib rebuilds the
+#   header byte from _port/_channel on send, so assigning `.header` directly
+#   would silently send the packet to port 0 (console).
+CRTP_PORT_LINK = 0x0F
+CRTP_CHANNEL_LINKSINK = 0x02
+KEEPALIVE_PERIOD_S = 0.25
+KEEPALIVE_IDLE_THRESHOLD_S = 0.20
+ODOM_STALL_GRACE_S = 3.0
+ODOM_STALL_TIMEOUT_S = 2.5
+CONSOLE_FAULT_KEYWORDS = (
+    "resumed after watchdog timeout",
+    "resumed after a failed assert",
+    "Hardfault.",
+    "Assert failed",
+)
+CONSOLE_REBOOT_KEYWORDS = (
+    "is up and running",
+    "resumed after watchdog timeout",
+    "resumed after a failed assert",
+)
 
 # The ootParams gain names live in crazybridge.pid_conf.LAYOUT.
 
@@ -302,34 +328,94 @@ class CrazyBridge(Node):
         self._connected = threading.Event()
         self._connect_failed = threading.Event()
         self._connect_error: str | None = None
-
-        self._cf = Crazyflie(rw_cache="./cache")
-        self._cf.fully_connected.add_callback(self._on_connected)
-        self._cf.disconnected.add_callback(self._on_disconnected)
-        self._cf.connection_failed.add_callback(self._on_connection_failed)
-        self._cf.connection_lost.add_callback(self._on_connection_lost)
-        self._cf.console.receivedChar.add_callback(self._on_console)
-
-        self.get_logger().info(f"Opening link to {self._uri}")
-        self._cf.open_link(self._uri)
-
-        timeout = float(
+        self._connect_mono: float = 0.0
+        self._last_odom_mono: float = 0.0
+        self._last_uplink_mono: float = 0.0
+        self._console_buf: str = ""
+        self._reconnect_lock = threading.Lock()
+        self._reconnecting: bool = False
+        self._shutting_down: bool = False
+        self._connection_timeout_s = float(
             self.get_parameter("connection_timeout_s")
             .get_parameter_value()
             .double_value
         )
-        if not self._connected.wait(timeout=timeout):
+
+        self._cf = self._create_cf()
+
+        self.get_logger().info(f"Opening link to {self._uri}")
+        self._cf.open_link(self._uri)
+
+        if (
+            not self._connected.wait(timeout=self._connection_timeout_s)
+            or self._connect_failed.is_set()
+        ):
             self._cf.close_link()
             raise RuntimeError(
-                f"Timed out connecting to {self._uri} after {timeout}s "
+                f"Timed out connecting to {self._uri} after {self._connection_timeout_s}s "
                 f"({self._connect_error or 'no failure callback fired'})"
             )
-            return
         self.add_on_set_parameters_callback(self._on_parameter_update)
+        self._keepalive_timer = self.create_timer(
+            KEEPALIVE_PERIOD_S, self._send_keepalive
+        )
         self._safety_interval = self.create_timer(1, self._safety_check)
 
-    def _on_console(self, text):
-        self.get_logger().info(text)
+    def _create_cf(self) -> Crazyflie:
+        cf = Crazyflie(rw_cache="./cache")
+        cf.fully_connected.add_callback(self._on_connected)
+        cf.disconnected.add_callback(self._on_disconnected)
+        cf.connection_failed.add_callback(self._on_connection_failed)
+        cf.connection_lost.add_callback(self._on_connection_lost)
+        cf.console.receivedChar.add_callback(self._on_console)
+        return cf
+
+    def _on_console(self, text: str) -> None:
+        self._console_buf += str(text)
+        while "\n" in self._console_buf:
+            line, self._console_buf = self._console_buf.split("\n", 1)
+            clean = line.strip()
+            if not clean:
+                continue
+            if any(k in clean for k in CONSOLE_FAULT_KEYWORDS):
+                self.get_logger().error(f"[CRAZYFLIE FAULT] {clean}")
+            else:
+                self.get_logger().info(clean)
+
+            if (
+                self._connect_mono > 0.0
+                and (monotonic() - self._connect_mono) > 1.0
+                and any(k in clean for k in CONSOLE_REBOOT_KEYWORDS)
+            ):
+                with self._safe_to_fly_lock:
+                    self._safe_to_fly = False
+                with self._bias_lock:
+                    self._ekf_bias_ready = False
+                    self._latest_imu_bias = None
+                self.get_logger().error(
+                    f"[CRAZYFLIE REBOOT DETECTED] Console reported {clean!r}; "
+                    "disarming and re-registering CRTP parameters & logs..."
+                )
+                self._schedule_reconnect(f"MCU reboot detected ({clean})")
+
+    def _send_keepalive(self) -> None:
+        """Send 4 Hz linkSink CRTP keepalive when mocap is idle so STM32 radiolink stays active."""
+        if self._shutting_down or self._reconnecting or not self._cf.is_connected():
+            return
+        now_m = monotonic()
+        if (now_m - self._last_uplink_mono) < KEEPALIVE_IDLE_THRESHOLD_S:
+            return
+        send_fn = getattr(self._cf, "send_packet", None)
+        if not callable(send_fn):
+            return
+        pk = CRTPPacket()
+        pk.set_header(CRTP_PORT_LINK, CRTP_CHANNEL_LINKSINK)
+        pk.data = [0]
+        try:
+            send_fn(pk)
+            self._last_uplink_mono = now_m
+        except Exception:
+            pass
 
     def _sanitise_log_period(self, value: int, name: str) -> int:
         # cflib divides period_in_ms by 10 (uint8 firmware ticks). Must be a
@@ -380,6 +466,12 @@ class CrazyBridge(Node):
 
     def _on_connected(self, link_uri: str) -> None:
         self.get_logger().info(f"Connected to {link_uri}")
+        self._loaded_pid_source = None
+        with self._bias_lock:
+            self._latest_ekf_flags = 0
+            self._ekf_bias_ready = False
+            self._latest_imu_bias = None
+            self._recent_imu.clear()
         if self._load_pid_conf:
             if self._explicit_pid_conf_path:
                 try:
@@ -422,6 +514,10 @@ class CrazyBridge(Node):
         self._setup_ekf_bias_logs()
         self._setup_ekf_adapt_logs()
 
+        now_m = monotonic()
+        self._connect_mono = now_m
+        self._last_odom_mono = now_m
+        self._last_uplink_mono = now_m
         self._connected.set()
 
     def _has_log_group(self, group: str) -> bool:
@@ -920,10 +1016,11 @@ class CrazyBridge(Node):
                 except Exception as exc:
                     self.get_logger().error(f"Failed to apply auto-detected PID conf: {exc}")
 
-        if self._cf.is_connected():
+        if self._cf.is_connected() and not self._reconnecting:
             self._cf.extpos.send_extpose(
                 pos.x, pos.y, pos.z, orie.x, orie.y, orie.z, orie.w
             )
+            self._last_uplink_mono = monotonic()
 
     def _marker_cb(self, msg: PointStamped) -> None:
         header: Header = msg.header
@@ -974,20 +1071,101 @@ class CrazyBridge(Node):
                 except Exception as exc:
                     self.get_logger().error(f"Failed to apply auto-detected PID conf: {exc}")
 
-        if self._cf.is_connected():
+        if self._cf.is_connected() and not self._reconnecting:
             self._cf.extpos.send_extpos(pt.x, pt.y, pt.z)
+            self._last_uplink_mono = monotonic()
+
+    def _schedule_reconnect(self, reason: str) -> None:
+        """Asynchronously close stale link, reopen Crazyflie, and re-register all CRTP logs."""
+        with self._reconnect_lock:
+            if self._reconnecting or self._shutting_down:
+                return
+            self._reconnecting = True
+        threading.Thread(
+            target=self._reconnect_worker, args=(reason,), daemon=True
+        ).start()
+
+    def _reconnect_worker(self, reason: str) -> None:
+        try:
+            while not self._shutting_down:
+                self._stop_all_logs()
+                try:
+                    self._cf.close_link()
+                except Exception:
+                    pass
+                sleep(0.5)
+                if self._shutting_down:
+                    break
+
+                self._connected.clear()
+                self._connect_failed.clear()
+                self._connect_error = None
+                self._connect_mono = 0.0
+                self._cf = self._create_cf()
+
+                self.get_logger().warning(
+                    f"[RECONNECT] Re-opening link to {self._uri} ({reason})..."
+                )
+                self._cf.open_link(self._uri)
+                if (
+                    self._connected.wait(timeout=self._connection_timeout_s)
+                    and not self._connect_failed.is_set()
+                    and self._cf.is_connected()
+                ):
+                    self.get_logger().info(
+                        f"[RECONNECT] Restored {self._uri} and re-registered PID, "
+                        f"estimator_mode={self._estimator_mode!r}, adapt_mode={self._adapt_mode!r}, "
+                        "and all CRTP log blocks."
+                    )
+                    break
+
+                try:
+                    self._cf.close_link()
+                except Exception:
+                    pass
+                self.get_logger().error(
+                    f"[RECONNECT] Failed to restore {self._uri} "
+                    f"({self._connect_error or 'timeout'}); retrying in 2.0s..."
+                )
+                sleep(2.0)
+        finally:
+            with self._reconnect_lock:
+                self._reconnecting = False
 
     def _safety_check(self) -> None:
+        if self._shutting_down or self._reconnecting:
+            return
+
         if not self._cf.is_connected():
-            self.get_logger().error("Disconnected from crazyflie. Trying to reconnect")
+            self.get_logger().error(
+                "Disconnected from Crazyflie; reconnecting and re-registering CRTP logs..."
+            )
             with self._safe_to_fly_lock:
-                self._cf.open_link(self._uri)
-                if self._connected.wait(timeout=1):
-                    self.get_logger().error("LANDING!!")
-                    if self._pos[2] > 0.1:
-                        self._cf.high_level_commander.land(0, 2)
-                        sleep(5)
-                    self._cf.supervisor.send_emergency_stop()
+                self._safe_to_fly = False
+            self._schedule_reconnect("radio link disconnected")
+            return
+
+        now_m = monotonic()
+        if (
+            self._connect_mono > 0.0
+            and (now_m - self._connect_mono) > ODOM_STALL_GRACE_S
+            and (now_m - self._last_odom_mono) > ODOM_STALL_TIMEOUT_S
+        ):
+            stalled_s = now_m - self._last_odom_mono
+            self.get_logger().error(
+                f"[TELEMETRY LOST] No odometry received from Crazyflie for {stalled_s:.1f}s "
+                "(MCU rebooted or reset CRTP log blocks). Disarming and re-registering logs..."
+            )
+            with self._safe_to_fly_lock:
+                was_safe = self._safe_to_fly
+                self._safe_to_fly = False
+            if was_safe and self._pos[2] > 0.1:
+                try:
+                    self._cf.high_level_commander.land(0, 2)
+                except Exception:
+                    pass
+            self._schedule_reconnect(f"odometry stalled for {stalled_s:.1f}s")
+            return
 
         if not self._mocap_locked:
             return
@@ -1198,6 +1376,7 @@ class CrazyBridge(Node):
         msg.twist.twist.linear.x = vel[0]
         msg.twist.twist.linear.y = vel[1]
         msg.twist.twist.linear.z = vel[2]
+        self._last_odom_mono = monotonic()
         self._pubs.odom.publish(msg)
 
     @staticmethod
@@ -1414,7 +1593,7 @@ class CrazyBridge(Node):
             response.message = str(exc)
         return response
 
-    def shutdown(self) -> None:
+    def _stop_all_logs(self) -> None:
         for name in (
             "_pos_log",
             "_q_log",
@@ -1437,6 +1616,11 @@ class CrazyBridge(Node):
                 log.stop()
             except Exception:
                 pass
+            setattr(self, name, None)
+
+    def shutdown(self) -> None:
+        self._shutting_down = True
+        self._stop_all_logs()
         self._cf.close_link()
 
 

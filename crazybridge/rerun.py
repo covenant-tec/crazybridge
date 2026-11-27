@@ -1,4 +1,4 @@
-from rerun_sdk import rerun as rr
+import rerun as rr
 import rclpy
 import numpy as np
 from rclpy.node import Node
