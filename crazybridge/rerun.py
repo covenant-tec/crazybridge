@@ -8,7 +8,7 @@ from sensor_msgs.msg import Imu
 from scipy.spatial.transform import Rotation
 from geometry_msgs.msg import Vector3, Quaternion, PoseWithCovariance, Pose, Point, PointStamped
 
-from crazybridge.interface import EkfOotDiag, Topics
+from crazybridge.interface import EkfAdaptDiag, EkfOotDiag, Topics
 
 class Rerun(Node):
     def __init__(self):
@@ -38,6 +38,7 @@ class Rerun(Node):
         self._planned_path: list[list[float]] = []
         self._actual_path: list[list[float]] = []
         self._ekf_series_initialized: bool = False
+        self._ekf_adapt_series_initialized: bool = False
 
         self._init_rerun()
         self._init_error_logs()
@@ -53,6 +54,9 @@ class Rerun(Node):
         self.create_subscription(PointStamped, 'setpoint', self._setpoint_cb, 1)
         self.create_subscription(
             Float32MultiArray, Topics.EKF_DIAG, self._ekf_diag_cb, 10
+        )
+        self.create_subscription(
+            Float32MultiArray, Topics.EKF_ADAPT, self._ekf_adapt_cb, 10
         )
 
     @staticmethod
@@ -109,6 +113,16 @@ class Rerun(Node):
             self._init_ekf_logs()
             self._ekf_series_initialized = True
         for (_, _, entity_path, _), val in zip(EkfOotDiag.FIELDS, msg.data):
+            rr.log(entity_path, rr.Scalars(float(val)))
+
+    def _ekf_adapt_cb(self, msg: Float32MultiArray):
+        """Plot optional Adaptive EKF (MDP / SMDP) telemetry only when published."""
+        if len(msg.data) < EkfAdaptDiag.NUM_FIELDS:
+            return
+        if not self._ekf_adapt_series_initialized:
+            self._init_ekf_adapt_logs()
+            self._ekf_adapt_series_initialized = True
+        for (_, _, entity_path, _), val in zip(EkfAdaptDiag.FIELDS, msg.data):
             rr.log(entity_path, rr.Scalars(float(val)))
 
     def _pos_err_cb(self, msg: Vector3):
@@ -245,6 +259,14 @@ class Rerun(Node):
 
     def _init_ekf_logs(self):
         for var_name, _, entity_path, color in EkfOotDiag.FIELDS:
+            rr.log(
+                entity_path,
+                rr.SeriesLines(colors=color, names=var_name),
+                static=True,
+            )
+
+    def _init_ekf_adapt_logs(self):
+        for var_name, _, entity_path, color in EkfAdaptDiag.FIELDS:
             rr.log(
                 entity_path,
                 rr.SeriesLines(colors=color, names=var_name),

@@ -51,8 +51,11 @@ from crazybridge import metrics
 from ament_index_python.packages import get_package_share_directory
 import os
 
+from crazybridge.adapt_conf import AdaptConf, default_adapt_conf_path
 from crazybridge.interface import (
+    AdaptMode,
     BridgeClientNode,
+    EkfAdaptDiag,
     EkfOotDiag,
     EstimatorMode,
     Topics,
@@ -74,8 +77,10 @@ class ControllerTest(BridgeClientNode):
         # The same pid.conf the bridge loaded; recorded alongside the metrics so
         # a run's numbers can be traced back to the gains that produced them.
         self.declare_parameter("pid_conf_path", "")
+        self.declare_parameter("adapt_conf_path", "")
         self.declare_parameter("tracking_mode", TrackingMode.AUTO)
-        self.declare_parameter("estimator_mode", EstimatorMode.AUTO)
+        self.declare_parameter("estimator_mode", EstimatorMode.STOCK)
+        self.declare_parameter("adapt_mode", AdaptMode.STATIC)
 
         # telemetry topic names (odom_topic comes from the base)
         self.declare_parameter("setpoint_topic", Topics.SETPOINT)
@@ -84,6 +89,7 @@ class ControllerTest(BridgeClientNode):
         self.declare_parameter("pos_error_topic", Topics.POS_ERROR)
         self.declare_parameter("imu_topic", Topics.IMU)
         self.declare_parameter("ekf_diag_topic", Topics.EKF_DIAG)
+        self.declare_parameter("ekf_adapt_topic", Topics.EKF_ADAPT)
         self.declare_parameter("battery_voltage_topic", Topics.BATTERY_VOLTAGE)
         self.declare_parameter("rigid_body_topic", Topics.RIGID_BODY)
         self.declare_parameter("marker_topic", Topics.MARKER)
@@ -116,6 +122,7 @@ class ControllerTest(BridgeClientNode):
         self._raw_mocap_source: str = "none"
         self._imu: list[list[float]] = []
         self._ekf_diag: list[list[float]] = []
+        self._ekf_adapt: list[list[float]] = []
         self._battery: list[list[float]] = []
 
         self.create_subscription(Float32, self._sp("thrust_topic"), self._thrust_cb, 50)
@@ -129,6 +136,9 @@ class ControllerTest(BridgeClientNode):
         self.create_subscription(Imu, self._sp("imu_topic"), self._imu_cb, 50)
         self.create_subscription(
             Float32MultiArray, self._sp("ekf_diag_topic"), self._ekf_diag_cb, 50
+        )
+        self.create_subscription(
+            Float32MultiArray, self._sp("ekf_adapt_topic"), self._ekf_adapt_cb, 50
         )
         self.create_subscription(
             Float32, self._sp("battery_voltage_topic"), self._battery_cb, 50
@@ -193,6 +203,15 @@ class ControllerTest(BridgeClientNode):
             self._ekf_diag.append([
                 self._now(),
                 *(float(v) for v in msg.data[: EkfOotDiag.NUM_FIELDS]),
+            ])
+
+    def _ekf_adapt_cb(self, msg: Float32MultiArray) -> None:
+        if len(msg.data) < EkfAdaptDiag.NUM_FIELDS:
+            return
+        with self._lock:
+            self._ekf_adapt.append([
+                self._now(),
+                *(float(v) for v in msg.data[: EkfAdaptDiag.NUM_FIELDS]),
             ])
 
     def _battery_cb(self, msg: Float32) -> None:
@@ -354,6 +373,9 @@ class ControllerTest(BridgeClientNode):
                 "ekf_diag": np.array(self._ekf_diag, dtype=float)
                 if self._ekf_diag
                 else np.empty((0, 1 + EkfOotDiag.NUM_FIELDS)),
+                "ekf_adapt": np.array(self._ekf_adapt, dtype=float)
+                if self._ekf_adapt
+                else np.empty((0, 1 + EkfAdaptDiag.NUM_FIELDS)),
                 "battery": np.array(self._battery, dtype=float)
                 if self._battery
                 else np.empty((0, 2)),
@@ -407,10 +429,26 @@ class ControllerTest(BridgeClientNode):
             return None, path
         return conf.as_dict(), path
 
+    def _adapt_policies(self, est_mode: str) -> tuple[dict | None, str | None]:
+        """The MDP/SMDP Bellman policies loaded when running OOT EKF."""
+        if est_mode == EstimatorMode.STOCK:
+            return None, None
+        raw_path = self._sp("adapt_conf_path").strip()
+        path = raw_path if raw_path else default_adapt_conf_path()
+        try:
+            conf = AdaptConf.load(path)
+        except Exception as exc:
+            self.get_logger().warning(f"could not read EKF policies from {path}: {exc}")
+            return None, path
+        return conf.as_dict(), path
+
     def report(self, ts: dict) -> dict:
         samples = self._samples()
         m = metrics.compute_metrics(samples, ts)
         gains, pid_conf_path = self._gains()
+        est_mode = self._sp("estimator_mode").strip().lower() or EstimatorMode.STOCK
+        adapt_mode = AdaptMode.normalize(self._sp("adapt_mode")) or AdaptMode.STATIC
+        adapt_policies, adapt_conf_path = self._adapt_policies(est_mode)
         config = self._sp("config_name")
         out_dir = self._sp("output_dir")
         metrics.write_reports(
@@ -422,7 +460,10 @@ class ControllerTest(BridgeClientNode):
             samples=samples,
             gains=gains,
             pid_conf_path=pid_conf_path,
-            estimator_mode=self._sp("estimator_mode"),
+            estimator_mode=est_mode,
+            adapt_mode=adapt_mode if est_mode != EstimatorMode.STOCK else None,
+            adapt_policies=adapt_policies,
+            adapt_conf_path=adapt_conf_path,
         )
         self.get_logger().info(
             f"wrote run artefacts to {metrics.run_dir(out_dir, config)}"

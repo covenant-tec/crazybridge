@@ -34,6 +34,7 @@ FILE_METRICS_JSON = 'metrics.json'
 FILE_METRICS_CSV = 'metrics.csv'
 FILE_TRAJ_NPZ = 'traj.npz'
 FILE_PID_CONF = 'pid.conf'
+FILE_ADAPT_CONF = 'adapt_policies.conf'
 FILE_TELEMETRY_CSV = 'flight_telemetry.csv'
 
 # Optional diagnostic columns appended to flight_telemetry.csv ONLY when an
@@ -49,6 +50,20 @@ EKF_DIAG_CSV_HEADERS = (
 )
 EKF_DIAG_NCOLS = len(EKF_DIAG_CSV_HEADERS)
 _EKF_DIAG_DISCRETE_COLS = (2, 3, 4)
+
+# Optional adaptive decision columns appended ONLY when ``ekfAdapt`` streamed.
+EKF_ADAPT_CSV_HEADERS = (
+    'ekf_tr_q',
+    'ekf_tr_r',
+    'ekf_decisions',
+    'ekf_qr_mods',
+    'ekf_tau',
+    'ekf_state2d',
+    'ekf_action',
+    'ekf_mode',
+)
+EKF_ADAPT_NCOLS = len(EKF_ADAPT_CSV_HEADERS)
+_EKF_ADAPT_DISCRETE_COLS = (2, 3, 4, 5, 6, 7)
 
 # numpy 2.0 renamed trapz -> trapezoid (and later removed the old name).
 try:
@@ -178,32 +193,44 @@ def _interp_array(arr: np.ndarray, t_eval: np.ndarray, ncols: int) -> np.ndarray
     return out
 
 
-def _resample_ekf_diag(arr: np.ndarray, t_eval: np.ndarray) -> np.ndarray:
-    """Resample ``ekf_diag`` onto ``t_eval`` using ZOH for integer flags/counters."""
+def _resample_mixed_block(
+    arr: np.ndarray, t_eval: np.ndarray, ncols: int, discrete_cols: tuple[int, ...]
+) -> np.ndarray:
+    """Resample a multi-column block onto ``t_eval`` with ZOH for discrete cols."""
     if arr is None or arr.size == 0 or len(arr.shape) != 2 or arr.shape[0] == 0:
-        return np.zeros((len(t_eval), EKF_DIAG_NCOLS))
+        return np.zeros((len(t_eval), ncols))
     t_source = arr[:, 0]
     unique_mask = np.concatenate(([True], np.diff(t_source) > 1e-9))
     arr_clean = arr[unique_mask]
-    actual_cols = min(EKF_DIAG_NCOLS, arr_clean.shape[1] - 1)
+    actual_cols = min(ncols, arr_clean.shape[1] - 1)
     if actual_cols <= 0:
-        return np.zeros((len(t_eval), EKF_DIAG_NCOLS))
+        return np.zeros((len(t_eval), ncols))
 
     if arr_clean.shape[0] == 1:
-        out = np.zeros((len(t_eval), EKF_DIAG_NCOLS))
+        out = np.zeros((len(t_eval), ncols))
         out[:, :actual_cols] = arr_clean[0, 1 : 1 + actual_cols]
         return out
 
-    out = _interp_array(arr_clean, t_eval, EKF_DIAG_NCOLS)
+    out = _interp_array(arr_clean, t_eval, ncols)
     idx = np.clip(
         np.searchsorted(arr_clean[:, 0], t_eval, side="right") - 1,
         0,
         arr_clean.shape[0] - 1,
     )
-    for col in _EKF_DIAG_DISCRETE_COLS:
+    for col in discrete_cols:
         if col < actual_cols:
             out[:, col] = arr_clean[idx, col + 1]
     return out
+
+
+def _resample_ekf_diag(arr: np.ndarray, t_eval: np.ndarray) -> np.ndarray:
+    """Resample ``ekf_diag`` onto ``t_eval`` using ZOH for integer flags/counters."""
+    return _resample_mixed_block(arr, t_eval, EKF_DIAG_NCOLS, _EKF_DIAG_DISCRETE_COLS)
+
+
+def _resample_ekf_adapt(arr: np.ndarray, t_eval: np.ndarray) -> np.ndarray:
+    """Resample ``ekf_adapt`` onto ``t_eval`` using ZOH for discrete states/actions."""
+    return _resample_mixed_block(arr, t_eval, EKF_ADAPT_NCOLS, _EKF_ADAPT_DISCRETE_COLS)
 
 
 def write_telemetry_csv(
@@ -227,6 +254,9 @@ def write_telemetry_csv(
     pos_err = np.asarray(samples_dict.get("pos_err", np.empty((0, 4))), dtype=float)
     ekf_diag = np.asarray(
         samples_dict.get("ekf_diag", np.empty((0, 1 + EKF_DIAG_NCOLS))), dtype=float
+    )
+    ekf_adapt = np.asarray(
+        samples_dict.get("ekf_adapt", np.empty((0, 1 + EKF_ADAPT_NCOLS))), dtype=float
     )
     battery = np.asarray(samples_dict.get("battery", np.empty((0, 2))), dtype=float)
     odom = np.asarray(traj.get("odom", np.empty((0, 11))), dtype=float)
@@ -302,6 +332,10 @@ def write_telemetry_csv(
         columns.append(_resample_ekf_diag(ekf_diag, t_eval))
         headers.extend(EKF_DIAG_CSV_HEADERS)
 
+    if ekf_adapt.ndim == 2 and ekf_adapt.shape[0] > 0:
+        columns.append(_resample_ekf_adapt(ekf_adapt, t_eval))
+        headers.extend(EKF_ADAPT_CSV_HEADERS)
+
     data = np.column_stack(columns)
 
     csv_path = os.path.join(dest, FILE_TELEMETRY_CSV)
@@ -323,6 +357,9 @@ def write_reports(
     gains: dict | None = None,
     pid_conf_path: str | None = None,
     estimator_mode: str | None = None,
+    adapt_mode: str | None = None,
+    adapt_policies: dict | None = None,
+    adapt_conf_path: str | None = None,
 ) -> dict:
     """Write one run's artefacts into ``<out_dir>/<config>/``.
 
@@ -346,7 +383,11 @@ def write_reports(
     ekf_diag = np.asarray(
         samples_dict.get("ekf_diag", np.empty((0, 1 + EKF_DIAG_NCOLS))), dtype=float
     )
+    ekf_adapt = np.asarray(
+        samples_dict.get("ekf_adapt", np.empty((0, 1 + EKF_ADAPT_NCOLS))), dtype=float
+    )
     has_ekf_diag = bool(ekf_diag.ndim == 2 and ekf_diag.shape[0] > 0)
+    has_ekf_adapt = bool(ekf_adapt.ndim == 2 and ekf_adapt.shape[0] > 0)
 
     report = {
         "config": config,
@@ -356,6 +397,12 @@ def write_reports(
     }
     if estimator_mode:
         report["estimator_mode"] = estimator_mode
+    if adapt_mode:
+        report["adapt_mode"] = adapt_mode
+    if adapt_policies is not None:
+        report["adapt_policies"] = adapt_policies
+    if adapt_conf_path:
+        report["adapt_conf_path"] = os.path.abspath(adapt_conf_path)
     if gains is not None:
         report["gains"] = gains
     if pid_conf_path:
@@ -386,16 +433,20 @@ def write_reports(
     )
     if has_ekf_diag:
         npz_payload["ekf_diag"] = ekf_diag
+    if has_ekf_adapt:
+        npz_payload["ekf_adapt"] = ekf_adapt
 
     np.savez(os.path.join(dest, FILE_TRAJ_NPZ), **npz_payload)
 
     # Export synchronized 50 Hz telemetry table to CSV
     write_telemetry_csv(dest, ts, traj, samples, dt=0.02)
 
-    # Copy the gain file itself, so the run folder is self-contained even if the
-    # source pid.conf is later edited in place.
+    # Copy the gain file (and policy file when OOT EKF is active) so the run
+    # folder is self-contained even if the source configs are later edited.
     if pid_conf_path and os.path.isfile(pid_conf_path):
         shutil.copyfile(pid_conf_path, os.path.join(dest, FILE_PID_CONF))
+    if adapt_conf_path and os.path.isfile(adapt_conf_path):
+        shutil.copyfile(adapt_conf_path, os.path.join(dest, FILE_ADAPT_CONF))
 
     return row
 
