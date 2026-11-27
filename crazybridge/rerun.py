@@ -8,7 +8,7 @@ from sensor_msgs.msg import Imu
 from scipy.spatial.transform import Rotation
 from geometry_msgs.msg import Vector3, Quaternion, PoseWithCovariance, Pose, Point, PointStamped
 
-from crazybridge.interface import EkfAdaptDiag, EkfOotDiag, Topics
+from crazybridge.interface import EkfAdaptDiag, EkfBiasDiag, EkfOotDiag, Topics
 
 class Rerun(Node):
     def __init__(self):
@@ -38,6 +38,7 @@ class Rerun(Node):
         self._planned_path: list[list[float]] = []
         self._actual_path: list[list[float]] = []
         self._ekf_series_initialized: bool = False
+        self._ekf_bias_series_initialized: bool = False
         self._ekf_adapt_series_initialized: bool = False
 
         self._init_rerun()
@@ -51,6 +52,9 @@ class Rerun(Node):
         self.create_subscription(Quaternion, 'orientation/error', self._qe_cb, 1)
         self.create_subscription(Odometry, Topics.ODOM, self._odometry_cb, 1)
         self.create_subscription(Imu, Topics.IMU, self._imu_cb, 10)
+        self.create_subscription(
+            Float32MultiArray, Topics.IMU_BIAS, self._imu_bias_cb, 10
+        )
         self.create_subscription(PointStamped, 'setpoint', self._setpoint_cb, 1)
         self.create_subscription(
             Float32MultiArray, Topics.EKF_DIAG, self._ekf_diag_cb, 10
@@ -123,6 +127,21 @@ class Rerun(Node):
             self._init_ekf_adapt_logs()
             self._ekf_adapt_series_initialized = True
         for (_, _, entity_path, _), val in zip(EkfAdaptDiag.FIELDS, msg.data):
+            rr.log(entity_path, rr.Scalars(float(val)))
+
+    def _imu_bias_cb(self, msg: Float32MultiArray):
+        """Plot calibrated stationary IMU bias when published."""
+        if len(msg.data) < EkfBiasDiag.NUM_FIELDS:
+            return
+        if not self._ekf_bias_series_initialized:
+            for var_name, _, entity_path, color in EkfBiasDiag.FIELDS:
+                rr.log(
+                    entity_path,
+                    rr.SeriesLines(colors=color, names=var_name),
+                    static=True,
+                )
+            self._ekf_bias_series_initialized = True
+        for (_, _, entity_path, _), val in zip(EkfBiasDiag.FIELDS, msg.data):
             rr.log(entity_path, rr.Scalars(float(val)))
 
     def _pos_err_cb(self, msg: Vector3):

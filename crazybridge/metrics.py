@@ -37,6 +37,18 @@ FILE_PID_CONF = 'pid.conf'
 FILE_ADAPT_CONF = 'adapt_policies.conf'
 FILE_TELEMETRY_CSV = 'flight_telemetry.csv'
 
+# Calibrated stationary IMU bias columns always present in flight_telemetry.csv
+# (m/s^2 and rad/s in FLU body frame, matching imu_* columns; NaN if unavailable).
+IMU_BIAS_CSV_HEADERS = (
+    'imu_bias_ax',
+    'imu_bias_ay',
+    'imu_bias_az',
+    'imu_bias_gx',
+    'imu_bias_gy',
+    'imu_bias_gz',
+)
+IMU_BIAS_NCOLS = len(IMU_BIAS_CSV_HEADERS)
+
 # Optional diagnostic columns appended to flight_telemetry.csv ONLY when an
 # Out-Of-Tree EKF (CRTP group ``ekfOot``) was detected during the flight.
 EKF_DIAG_CSV_HEADERS = (
@@ -233,6 +245,96 @@ def _resample_ekf_adapt(arr: np.ndarray, t_eval: np.ndarray) -> np.ndarray:
     return _resample_mixed_block(arr, t_eval, EKF_ADAPT_NCOLS, _EKF_ADAPT_DISCRETE_COLS)
 
 
+def _resample_imu_bias(arr: np.ndarray, t_eval: np.ndarray) -> np.ndarray:
+    """Resample ``imu_bias`` onto ``t_eval`` with ZOH; return ``NaN`` (never ``0``) if absent."""
+    n = len(t_eval)
+    if (
+        arr is None
+        or arr.size == 0
+        or arr.ndim != 2
+        or arr.shape[1] < 1 + IMU_BIAS_NCOLS
+    ):
+        return np.full((n, IMU_BIAS_NCOLS), np.nan)
+    finite_mask = np.all(np.isfinite(arr[:, : 1 + IMU_BIAS_NCOLS]), axis=1)
+    arr_valid = arr[finite_mask]
+    if arr_valid.shape[0] == 0:
+        return np.full((n, IMU_BIAS_NCOLS), np.nan)
+    unique_mask = np.concatenate(([True], np.diff(arr_valid[:, 0]) > 1e-9))
+    arr_clean = arr_valid[unique_mask]
+    if arr_clean.shape[0] == 1:
+        return np.tile(arr_clean[0, 1 : 1 + IMU_BIAS_NCOLS], (n, 1))
+    idx = np.clip(
+        np.searchsorted(arr_clean[:, 0], t_eval, side="right") - 1,
+        0,
+        arr_clean.shape[0] - 1,
+    )
+    return arr_clean[idx, 1 : 1 + IMU_BIAS_NCOLS].copy()
+
+
+def _extract_imu_bias_summary(arr: np.ndarray) -> dict[str, float] | None:
+    """Extract calibrated bias dict from ``imu_bias`` sample array, or ``None`` if absent."""
+    if (
+        arr is None
+        or arr.size == 0
+        or arr.ndim != 2
+        or arr.shape[1] < 1 + IMU_BIAS_NCOLS
+    ):
+        return None
+    finite_mask = np.all(np.isfinite(arr[:, : 1 + IMU_BIAS_NCOLS]), axis=1)
+    arr_valid = arr[finite_mask]
+    if arr_valid.shape[0] == 0:
+        return None
+    b = arr_valid[-1, 1 : 1 + IMU_BIAS_NCOLS]
+    return {
+        "ax": float(b[0]),
+        "ay": float(b[1]),
+        "az": float(b[2]),
+        "gx": float(b[3]),
+        "gy": float(b[4]),
+        "gz": float(b[5]),
+    }
+
+
+def compute_channel_rates(traj: dict, samples: dict | None = None) -> dict[str, dict]:
+    """Compute effective packet count, span, and Hz rate for each logged channel."""
+    samples_dict = samples or {}
+    channels = (
+        ("odom", traj.get("odom")),
+        ("setpoint", traj.get("setpoint")),
+        ("raw_mocap", samples_dict.get("raw_mocap")),
+        ("thrust", samples_dict.get("thrust")),
+        ("torque", samples_dict.get("torque")),
+        ("pos_err", samples_dict.get("pos_err")),
+        ("imu", samples_dict.get("imu")),
+        ("ekf_diag", samples_dict.get("ekf_diag")),
+        ("ekf_adapt", samples_dict.get("ekf_adapt")),
+        ("battery", samples_dict.get("battery")),
+        ("imu_bias", samples_dict.get("imu_bias")),
+    )
+    out: dict[str, dict] = {}
+    for name, raw in channels:
+        arr = np.asarray(raw) if raw is not None else np.empty((0, 0))
+        n = int(arr.shape[0]) if arr.ndim == 2 else 0
+        if n >= 2 and arr.shape[1] >= 1:
+            t = arr[:, 0].astype(float)
+            span_s = float(t[-1] - t[0])
+            dt_pos = np.diff(t)
+            dt_pos = dt_pos[dt_pos > 1e-9]
+            rate_hz = float((n - 1) / span_s) if span_s > 1e-6 else 0.0
+            median_dt_ms = float(np.median(dt_pos) * 1000.0) if dt_pos.size > 0 else None
+        else:
+            span_s = 0.0
+            rate_hz = 0.0
+            median_dt_ms = None
+        out[name] = {
+            "samples": n,
+            "span_s": round(span_s, 4),
+            "rate_hz": round(rate_hz, 3),
+            "median_dt_ms": round(median_dt_ms, 3) if median_dt_ms is not None else None,
+        }
+    return out
+
+
 def write_telemetry_csv(
     dest: str, ts: dict, traj: dict, samples: dict | None, dt: float = 0.02
 ) -> str:
@@ -259,6 +361,9 @@ def write_telemetry_csv(
         samples_dict.get("ekf_adapt", np.empty((0, 1 + EKF_ADAPT_NCOLS))), dtype=float
     )
     battery = np.asarray(samples_dict.get("battery", np.empty((0, 2))), dtype=float)
+    imu_bias = np.asarray(
+        samples_dict.get("imu_bias", np.empty((0, 1 + IMU_BIAS_NCOLS))), dtype=float
+    )
     odom = np.asarray(traj.get("odom", np.empty((0, 11))), dtype=float)
     setpoint = np.asarray(traj.get("setpoint", np.empty((0, 4))), dtype=float)
 
@@ -272,8 +377,11 @@ def write_telemetry_csv(
     # Battery voltage [V]; NaN (not 0) when the bridge published no samples.
     if battery.ndim == 2 and battery.shape[0] >= 2:
         interp_vbat = _interp_array(battery, t_eval, 1)
+    elif battery.ndim == 2 and battery.shape[0] == 1 and np.isfinite(battery[0, 1]):
+        interp_vbat = np.full((len(t_eval), 1), float(battery[0, 1]))
     else:
         interp_vbat = np.full((len(t_eval), 1), np.nan)
+    interp_imu_bias = _resample_imu_bias(imu_bias, t_eval)
 
     rel_t = t_eval - t_eval[0]
     columns = [
@@ -287,6 +395,7 @@ def write_telemetry_csv(
         interp_torque,
         interp_err,
         interp_vbat,
+        interp_imu_bias,
     ]
 
     headers = [
@@ -326,6 +435,7 @@ def write_telemetry_csv(
         "pos_err_y",
         "pos_err_z",
         "vbat",
+        *IMU_BIAS_CSV_HEADERS,
     ]
 
     if ekf_diag.ndim == 2 and ekf_diag.shape[0] > 0:
@@ -377,6 +487,9 @@ def write_reports(
     samples_dict = samples or {}
     raw_mocap = np.asarray(samples_dict.get("raw_mocap", np.empty((0, 8))), dtype=float)
     imu = np.asarray(samples_dict.get("imu", np.empty((0, 7))), dtype=float)
+    imu_bias = np.asarray(
+        samples_dict.get("imu_bias", np.empty((0, 1 + IMU_BIAS_NCOLS))), dtype=float
+    )
     thrust = np.asarray(samples_dict.get("thrust", np.empty((0, 2))), dtype=float)
     torque = np.asarray(samples_dict.get("torque", np.empty((0, 4))), dtype=float)
     pos_err = np.asarray(samples_dict.get("pos_err", np.empty((0, 4))), dtype=float)
@@ -388,17 +501,19 @@ def write_reports(
     )
     has_ekf_diag = bool(ekf_diag.ndim == 2 and ekf_diag.shape[0] > 0)
     has_ekf_adapt = bool(ekf_adapt.ndim == 2 and ekf_adapt.shape[0] > 0)
+    imu_bias_summary = _extract_imu_bias_summary(imu_bias)
+    channel_rates = compute_channel_rates(traj, samples_dict)
 
     report = {
         "config": config,
+        "estimator_mode": estimator_mode,
+        "adapt_mode": adapt_mode,
         "ekf_oot_detected": has_ekf_diag,
+        "imu_bias": imu_bias_summary,
+        "channel_rates": channel_rates,
         "timestamps": ts,
         "metrics": metrics,
     }
-    if estimator_mode:
-        report["estimator_mode"] = estimator_mode
-    if adapt_mode:
-        report["adapt_mode"] = adapt_mode
     if adapt_policies is not None:
         report["adapt_policies"] = adapt_policies
     if adapt_conf_path:
@@ -421,6 +536,7 @@ def write_reports(
         setpoint=np.asarray(traj.get("setpoint", np.empty((0, 4))), dtype=float),
         raw_mocap=raw_mocap,
         imu=imu,
+        imu_bias=imu_bias,
         thrust=thrust,
         torque=torque,
         pos_err=pos_err,
