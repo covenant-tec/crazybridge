@@ -47,6 +47,42 @@ class EstimatorMode:
     STOCK = "stock"
 
 
+class AdaptMode:
+    """Supported covariance adaptation policies for the Out-Of-Tree 13-state EKF."""
+
+    STATIC = "static"
+    MDP = "mdp"
+    SMDP = "smdp"
+
+    ALIASES = {
+        "static": STATIC,
+        "none": STATIC,
+        "off": STATIC,
+        "base": STATIC,
+        "0": STATIC,
+        "mdp": MDP,
+        "markov": MDP,
+        "1": MDP,
+        "smdp": SMDP,
+        "semimarkov": SMDP,
+        "semi_markov": SMDP,
+        "semi-markov": SMDP,
+        "2": SMDP,
+    }
+
+    FIRMWARE_ID = {
+        STATIC: 0,
+        MDP: 1,
+        SMDP: 2,
+    }
+
+    @classmethod
+    def normalize(cls, raw: str | None) -> str | None:
+        if raw is None:
+            return None
+        return cls.ALIASES.get(str(raw).strip().lower())
+
+
 class EkfOotDiag:
     """CRTP and ROS 2 schema for Out-Of-Tree EKF control and diagnostics.
 
@@ -58,6 +94,10 @@ class EkfOotDiag:
 
     LOG_GROUP = "ekfOot"
     PARAM_USE_STOCK = "ekfOot.useStock"
+    PARAM_MODE = "ekfOot.mode"
+    PARAM_RESET = "ekfOot.reset"
+    PARAM_ENABLE_CLAMP = "ekfOot.enableClamp"
+    PARAM_RECONN_SKIP = "ekfOot.reconnSkip"
 
     # Ordered tuple of (crtp_var_name, cflib_type, rerun_entity_path, rgb_color).
     # Total CRTP payload: 4 + 4 + 2 + 2 + 1 + 4 + 4 = 21 bytes (<= 26 B limit).
@@ -73,6 +113,29 @@ class EkfOotDiag:
     NUM_FIELDS = len(FIELDS)
 
 
+class EkfAdaptDiag:
+    """CRTP and ROS 2 schema for Adaptive EKF (MDP 2D / SMDP) decision telemetry.
+
+    Published on ``Topics.EKF_ADAPT`` (``std_msgs/Float32MultiArray``) only when
+    the connected Crazyflie exposes ``ekfAdapt`` in its TOC and OOT EKF is active.
+    """
+
+    LOG_GROUP = "ekfAdapt"
+
+    # Total CRTP payload: 4 + 4 + 2 + 2 + 2 + 1 + 1 + 1 = 17 bytes (<= 26 B limit).
+    FIELDS = (
+        ("trQ", "float", "/ekf_adapt/tr_q", [80, 180, 255]),
+        ("trR", "float", "/ekf_adapt/tr_r", [255, 100, 100]),
+        ("decisions", "uint16_t", "/ekf_adapt/decisions", [255, 200, 60]),
+        ("qrMods", "uint16_t", "/ekf_adapt/qr_mods", [255, 130, 60]),
+        ("tau", "uint16_t", "/ekf_adapt/tau", [160, 255, 160]),
+        ("state2d", "uint8_t", "/ekf_adapt/state2d", [200, 140, 255]),
+        ("action", "uint8_t", "/ekf_adapt/action", [255, 90, 200]),
+        ("mode", "uint8_t", "/ekf_adapt/mode", [180, 220, 220]),
+    )
+    NUM_FIELDS = len(FIELDS)
+
+
 class Create:
     """Names the bridge node passes to create_publisher / create_service."""
 
@@ -81,6 +144,7 @@ class Create:
     BATTERY = "~/battery"
     BATTERY_VOLTAGE = "~/battery_voltage"
     EKF_DIAG = "~/ekf_diag"
+    EKF_ADAPT = "~/ekf_adapt"
     THRUST = "thrust"
     TORQUE = "torque"
     POS_ERROR = "pos_error"
@@ -104,6 +168,7 @@ class Topics:
     BATTERY = "/crazybridge/battery"
     BATTERY_VOLTAGE = "/crazybridge/battery_voltage"
     EKF_DIAG = "/crazybridge/ekf_diag"
+    EKF_ADAPT = "/crazybridge/ekf_adapt"
     THRUST = "/thrust"
     TORQUE = "/torque"
     POS_ERROR = "/pos_error"
@@ -154,6 +219,7 @@ class BridgePublishers:
         self.orientation_error = node.create_publisher(Quaternion, Create.ORI_ERROR, 1)
         self.imu = node.create_publisher(Imu, Create.IMU, 10)
         self.ekf_diag = node.create_publisher(Float32MultiArray, Create.EKF_DIAG, 10)
+        self.ekf_adapt = node.create_publisher(Float32MultiArray, Create.EKF_ADAPT, 10)
 
 
 class BridgeClientNode(Node):
