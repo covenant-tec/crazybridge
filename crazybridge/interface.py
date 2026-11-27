@@ -79,6 +79,7 @@ class Create:
     ODOM = "~/odometry"
     IMU = "~/imu"
     BATTERY = "~/battery"
+    BATTERY_VOLTAGE = "~/battery_voltage"
     EKF_DIAG = "~/ekf_diag"
     THRUST = "thrust"
     TORQUE = "torque"
@@ -101,6 +102,7 @@ class Topics:
     ODOM = "/crazybridge/odometry"
     IMU = "/crazybridge/imu"
     BATTERY = "/crazybridge/battery"
+    BATTERY_VOLTAGE = "/crazybridge/battery_voltage"
     EKF_DIAG = "/crazybridge/ekf_diag"
     THRUST = "/thrust"
     TORQUE = "/torque"
@@ -139,6 +141,9 @@ class BridgePublishers:
     def __init__(self, node) -> None:
         self.odom = node.create_publisher(Odometry, Create.ODOM, 1)
         self.battery = node.create_publisher(Float32, Create.BATTERY, 1)
+        self.battery_voltage = node.create_publisher(
+            Float32, Create.BATTERY_VOLTAGE, 10
+        )
         self.thrust = node.create_publisher(Float32, Create.THRUST, 1)
         self.torque = node.create_publisher(Vector3, Create.TORQUE, 1)
         self.pos_error = node.create_publisher(Vector3, Create.POS_ERROR, 1)

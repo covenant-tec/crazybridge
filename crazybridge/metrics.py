@@ -228,6 +228,7 @@ def write_telemetry_csv(
     ekf_diag = np.asarray(
         samples_dict.get("ekf_diag", np.empty((0, 1 + EKF_DIAG_NCOLS))), dtype=float
     )
+    battery = np.asarray(samples_dict.get("battery", np.empty((0, 2))), dtype=float)
     odom = np.asarray(traj.get("odom", np.empty((0, 11))), dtype=float)
     setpoint = np.asarray(traj.get("setpoint", np.empty((0, 4))), dtype=float)
 
@@ -238,6 +239,11 @@ def write_telemetry_csv(
     interp_thrust = _interp_array(thrust, t_eval, 1)
     interp_torque = _interp_array(torque, t_eval, 3)
     interp_err = _interp_array(pos_err, t_eval, 3)
+    # Battery voltage [V]; NaN (not 0) when the bridge published no samples.
+    if battery.ndim == 2 and battery.shape[0] >= 2:
+        interp_vbat = _interp_array(battery, t_eval, 1)
+    else:
+        interp_vbat = np.full((len(t_eval), 1), np.nan)
 
     rel_t = t_eval - t_eval[0]
     columns = [
@@ -250,6 +256,7 @@ def write_telemetry_csv(
         interp_thrust,
         interp_torque,
         interp_err,
+        interp_vbat,
     ]
 
     headers = [
@@ -288,6 +295,7 @@ def write_telemetry_csv(
         "pos_err_x",
         "pos_err_y",
         "pos_err_z",
+        "vbat",
     ]
 
     if ekf_diag.ndim == 2 and ekf_diag.shape[0] > 0:
@@ -374,6 +382,7 @@ def write_reports(
         clockwise=bool(traj.get("clockwise", False)),
         t_start=float(ts["t_start"]),
         t_land_end=float(ts["t_land_end"]),
+        battery=np.asarray(samples_dict.get("battery", np.empty((0, 2))), dtype=float),
     )
     if has_ekf_diag:
         npz_payload["ekf_diag"] = ekf_diag

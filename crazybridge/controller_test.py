@@ -84,6 +84,7 @@ class ControllerTest(BridgeClientNode):
         self.declare_parameter("pos_error_topic", Topics.POS_ERROR)
         self.declare_parameter("imu_topic", Topics.IMU)
         self.declare_parameter("ekf_diag_topic", Topics.EKF_DIAG)
+        self.declare_parameter("battery_voltage_topic", Topics.BATTERY_VOLTAGE)
         self.declare_parameter("rigid_body_topic", Topics.RIGID_BODY)
         self.declare_parameter("marker_topic", Topics.MARKER)
 
@@ -115,6 +116,7 @@ class ControllerTest(BridgeClientNode):
         self._raw_mocap_source: str = "none"
         self._imu: list[list[float]] = []
         self._ekf_diag: list[list[float]] = []
+        self._battery: list[list[float]] = []
 
         self.create_subscription(Float32, self._sp("thrust_topic"), self._thrust_cb, 50)
         self.create_subscription(Vector3, self._sp("torque_topic"), self._torque_cb, 50)
@@ -127,6 +129,9 @@ class ControllerTest(BridgeClientNode):
         self.create_subscription(Imu, self._sp("imu_topic"), self._imu_cb, 50)
         self.create_subscription(
             Float32MultiArray, self._sp("ekf_diag_topic"), self._ekf_diag_cb, 50
+        )
+        self.create_subscription(
+            Float32, self._sp("battery_voltage_topic"), self._battery_cb, 50
         )
         qos_best_effort = QoSProfile(
             depth=10, reliability=ReliabilityPolicy.BEST_EFFORT
@@ -189,6 +194,10 @@ class ControllerTest(BridgeClientNode):
                 self._now(),
                 *(float(v) for v in msg.data[: EkfOotDiag.NUM_FIELDS]),
             ])
+
+    def _battery_cb(self, msg: Float32) -> None:
+        with self._lock:
+            self._battery.append([self._now(), float(msg.data)])
 
     def _rigid_body_cb(self, msg: PoseStamped) -> None:
         p = msg.pose.position
@@ -345,6 +354,9 @@ class ControllerTest(BridgeClientNode):
                 "ekf_diag": np.array(self._ekf_diag, dtype=float)
                 if self._ekf_diag
                 else np.empty((0, 1 + EkfOotDiag.NUM_FIELDS)),
+                "battery": np.array(self._battery, dtype=float)
+                if self._battery
+                else np.empty((0, 2)),
             }
 
     def _traj(self) -> dict:

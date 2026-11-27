@@ -443,9 +443,11 @@ class CrazyBridge(Node):
         self._imu_log.add_variable("gyro.y", "float")
         self._imu_log.add_variable("gyro.z", "float")
 
-        extra_period = self._sanitise_log_period(500, "extra_log_ms")
+        # 100 ms so the CSV captures voltage sag under load during the flight.
+        extra_period = self._sanitise_log_period(100, "extra_log_ms")
         self._pm_log = LogConfig(name="battery", period_in_ms=extra_period)
         self._pm_log.add_variable("pm.batteryLevel", "uint8_t")
+        self._pm_log.add_variable("pm.vbat", "float")
 
         self._setpoint_log = LogConfig(
             name="ctrltarget", period_in_ms=self._log_period_ms
@@ -556,6 +558,9 @@ class CrazyBridge(Node):
         batt_msg = Float32()
         batt_msg.data = float(data["pm.batteryLevel"])
         self._pubs.battery.publish(batt_msg)
+        vbat_msg = Float32()
+        vbat_msg.data = float(data["pm.vbat"])
+        self._pubs.battery_voltage.publish(vbat_msg)
 
     def _on_setpoint_log(self, _timestamp, data, _logconf):
         msg = PointStamped()
