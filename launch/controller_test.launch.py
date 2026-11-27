@@ -44,8 +44,20 @@ def generate_launch_description() -> LaunchDescription:
             'tracking_mode', default_value='auto',
             description="Mocap tracking mode: 'rigid_body' (6-DoF), 'marker' (single-ball 3-DoF), or 'auto'."),
         DeclareLaunchArgument(
-            'estimator_mode', default_value='auto',
-            description="State estimator mode: 'oot' (13-state OOT EKF), 'stock' (Bitcraze Kalman), or 'auto'."),
+            'estimator_mode', default_value='stock',
+            description="State estimator mode: 'stock' (default Bitcraze Kalman), 'oot' (13-state OOT AEKF), or 'auto'."),
+        DeclareLaunchArgument(
+            'adapt_mode', default_value='static',
+            description="OOT EKF covariance adaptation mode: 'static' (default, no adaptation), 'mdp' (Markov 2D), or 'smdp' (Semi-Markov)."),
+        DeclareLaunchArgument(
+            'adapt_conf_path', default_value='',
+            description='Path to adapt_policies.conf with MDP/SMDP Bellman policies (empty = default config/adapt_policies.conf).'),
+        DeclareLaunchArgument(
+            'ekf_enable_clamp', default_value='false',
+            description='Enable safety Q/R bounds on OOT EKF adaptation (true/false).'),
+        DeclareLaunchArgument(
+            'ekf_reconn_skip', default_value='false',
+            description='Skip decision trigger on the first OptiTrack sample after a dropout (true/false).'),
         DeclareLaunchArgument(
             'pid_conf_path', default_value='',
             description='OOT gain file to load for this run (empty = auto-resolve based on tracking_mode).'),
@@ -91,6 +103,10 @@ def generate_launch_description() -> LaunchDescription:
             'uri': LaunchConfiguration('uri'),
             'tracking_mode': LaunchConfiguration('tracking_mode'),
             'estimator_mode': LaunchConfiguration('estimator_mode'),
+            'adapt_mode': LaunchConfiguration('adapt_mode'),
+            'adapt_conf_path': LaunchConfiguration('adapt_conf_path'),
+            'ekf_enable_clamp': LaunchConfiguration('ekf_enable_clamp'),
+            'ekf_reconn_skip': LaunchConfiguration('ekf_reconn_skip'),
             'pid_conf_path': LaunchConfiguration('pid_conf_path'),
             'load_pid_conf': True,
         }],
@@ -123,8 +139,10 @@ def generate_launch_description() -> LaunchDescription:
             'output_dir': LaunchConfiguration('output_dir'),
             # Same gain file the bridge loads; recorded with the metrics.
             'pid_conf_path': LaunchConfiguration('pid_conf_path'),
+            'adapt_conf_path': LaunchConfiguration('adapt_conf_path'),
             'tracking_mode': LaunchConfiguration('tracking_mode'),
             'estimator_mode': LaunchConfiguration('estimator_mode'),
+            'adapt_mode': LaunchConfiguration('adapt_mode'),
             'takeoff_height_m': LaunchConfiguration('takeoff_height_m'),
             'goal_xyz': LaunchConfiguration('goal_xyz'),
             'circle_radius_m': LaunchConfiguration('circle_radius_m'),

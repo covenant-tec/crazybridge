@@ -5,8 +5,11 @@
 # Usage (inside Ubuntu 24 Distrobox):
 #   ./run_ekf_test.sh [config_name] [extra ros2 args...]
 #
-# Example:
-#   ./run_ekf_test.sh vuelo_ekf_01
+# Examples:
+#   ./run_ekf_test.sh vuelo_stock_01
+#   ESTIMATOR_MODE=oot ADAPT_MODE=static ./run_ekf_test.sh vuelo_ekf_static_01
+#   ESTIMATOR_MODE=oot ADAPT_MODE=mdp    ./run_ekf_test.sh vuelo_ekf_mdp_01
+#   ESTIMATOR_MODE=oot ADAPT_MODE=smdp   ./run_ekf_test.sh vuelo_ekf_smdp_01
 
 set -euo pipefail
 
@@ -26,8 +29,19 @@ set +u
 source "${WORKSPACE_ROOT}/source_all.sh"
 set -u
 
+EXTRA_TEST_ARGS=()
+if [[ -n "${ESTIMATOR_MODE:-}" ]]; then
+    ros2 param set /crazybridge estimator_mode "${ESTIMATOR_MODE}"
+    EXTRA_TEST_ARGS+=(-p "estimator_mode:=${ESTIMATOR_MODE}")
+fi
+if [[ -n "${ADAPT_MODE:-}" ]]; then
+    ros2 param set /crazybridge adapt_mode "${ADAPT_MODE}"
+    EXTRA_TEST_ARGS+=(-p "adapt_mode:=${ADAPT_MODE}")
+fi
+
 exec ros2 run crazybridge controller_test --ros-args \
     -p "config_name:=${CONFIG_NAME}" \
     -p "output_dir:=${OUTPUT_DIR}" \
     -p "tracking_mode:=rigid_body" \
+    "${EXTRA_TEST_ARGS[@]}" \
     "$@"

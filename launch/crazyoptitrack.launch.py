@@ -16,8 +16,28 @@ def generate_launch_description() -> LaunchDescription:
     )
     estimator_mode_arg = DeclareLaunchArgument(
         "estimator_mode",
-        default_value="auto",
-        description="State estimator mode: 'oot' (13-state OOT EKF), 'stock' (Bitcraze Kalman), or 'auto'.",
+        default_value="stock",
+        description="State estimator mode: 'stock' (default Bitcraze Kalman), 'oot' (13-state OOT AEKF), or 'auto'.",
+    )
+    adapt_mode_arg = DeclareLaunchArgument(
+        "adapt_mode",
+        default_value="static",
+        description="OOT EKF covariance adaptation mode: 'static' (default, no adaptation), 'mdp' (Markov 2D), or 'smdp' (Semi-Markov).",
+    )
+    adapt_conf_arg = DeclareLaunchArgument(
+        "adapt_conf_path",
+        default_value="",
+        description="Path to adapt_policies.conf with MDP/SMDP Bellman policies (empty = default config/adapt_policies.conf).",
+    )
+    ekf_enable_clamp_arg = DeclareLaunchArgument(
+        "ekf_enable_clamp",
+        default_value="false",
+        description="Enable safety Q/R bounds on OOT EKF adaptation (true/false).",
+    )
+    ekf_reconn_skip_arg = DeclareLaunchArgument(
+        "ekf_reconn_skip",
+        default_value="false",
+        description="Skip decision trigger on the first OptiTrack sample after a dropout (true/false).",
     )
     uri_arg = DeclareLaunchArgument(
         "uri",
@@ -82,6 +102,10 @@ def generate_launch_description() -> LaunchDescription:
         [
             tracking_mode_arg,
             estimator_mode_arg,
+            adapt_mode_arg,
+            adapt_conf_arg,
+            ekf_enable_clamp_arg,
+            ekf_reconn_skip_arg,
             uri_arg,
             log_period_arg,
             oot_log_period_arg,
@@ -101,6 +125,10 @@ def generate_launch_description() -> LaunchDescription:
                         "uri": LaunchConfiguration("uri"),
                         "tracking_mode": LaunchConfiguration("tracking_mode"),
                         "estimator_mode": LaunchConfiguration("estimator_mode"),
+                        "adapt_mode": LaunchConfiguration("adapt_mode"),
+                        "adapt_conf_path": LaunchConfiguration("adapt_conf_path"),
+                        "ekf_enable_clamp": LaunchConfiguration("ekf_enable_clamp"),
+                        "ekf_reconn_skip": LaunchConfiguration("ekf_reconn_skip"),
                         "log_period_ms": LaunchConfiguration("log_period_ms"),
                         "oot_log_period_ms": LaunchConfiguration("oot_log_period_ms"),
                         "pid_conf_path": LaunchConfiguration("pid_conf_path"),
