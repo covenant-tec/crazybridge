@@ -36,6 +36,20 @@ FILE_TRAJ_NPZ = 'traj.npz'
 FILE_PID_CONF = 'pid.conf'
 FILE_TELEMETRY_CSV = 'flight_telemetry.csv'
 
+# Optional diagnostic columns appended to flight_telemetry.csv ONLY when an
+# Out-Of-Tree EKF (CRTP group ``ekfOot``) was detected during the flight.
+EKF_DIAG_CSV_HEADERS = (
+    'ekf_d_mahal',
+    'ekf_tr_p',
+    'ekf_chol_fails',
+    'ekf_nan_resets',
+    'ekf_flags',
+    'ekf_rt_pred',
+    'ekf_rt_upd',
+)
+EKF_DIAG_NCOLS = len(EKF_DIAG_CSV_HEADERS)
+_EKF_DIAG_DISCRETE_COLS = (2, 3, 4)
+
 # numpy 2.0 renamed trapz -> trapezoid (and later removed the old name).
 try:
     from numpy import trapezoid as _np_trapz
@@ -164,6 +178,34 @@ def _interp_array(arr: np.ndarray, t_eval: np.ndarray, ncols: int) -> np.ndarray
     return out
 
 
+def _resample_ekf_diag(arr: np.ndarray, t_eval: np.ndarray) -> np.ndarray:
+    """Resample ``ekf_diag`` onto ``t_eval`` using ZOH for integer flags/counters."""
+    if arr is None or arr.size == 0 or len(arr.shape) != 2 or arr.shape[0] == 0:
+        return np.zeros((len(t_eval), EKF_DIAG_NCOLS))
+    t_source = arr[:, 0]
+    unique_mask = np.concatenate(([True], np.diff(t_source) > 1e-9))
+    arr_clean = arr[unique_mask]
+    actual_cols = min(EKF_DIAG_NCOLS, arr_clean.shape[1] - 1)
+    if actual_cols <= 0:
+        return np.zeros((len(t_eval), EKF_DIAG_NCOLS))
+
+    if arr_clean.shape[0] == 1:
+        out = np.zeros((len(t_eval), EKF_DIAG_NCOLS))
+        out[:, :actual_cols] = arr_clean[0, 1 : 1 + actual_cols]
+        return out
+
+    out = _interp_array(arr_clean, t_eval, EKF_DIAG_NCOLS)
+    idx = np.clip(
+        np.searchsorted(arr_clean[:, 0], t_eval, side="right") - 1,
+        0,
+        arr_clean.shape[0] - 1,
+    )
+    for col in _EKF_DIAG_DISCRETE_COLS:
+        if col < actual_cols:
+            out[:, col] = arr_clean[idx, col + 1]
+    return out
+
+
 def write_telemetry_csv(
     dest: str, ts: dict, traj: dict, samples: dict | None, dt: float = 0.02
 ) -> str:
@@ -183,6 +225,9 @@ def write_telemetry_csv(
     thrust = np.asarray(samples_dict.get("thrust", np.empty((0, 2))), dtype=float)
     torque = np.asarray(samples_dict.get("torque", np.empty((0, 4))), dtype=float)
     pos_err = np.asarray(samples_dict.get("pos_err", np.empty((0, 4))), dtype=float)
+    ekf_diag = np.asarray(
+        samples_dict.get("ekf_diag", np.empty((0, 1 + EKF_DIAG_NCOLS))), dtype=float
+    )
     odom = np.asarray(traj.get("odom", np.empty((0, 11))), dtype=float)
     setpoint = np.asarray(traj.get("setpoint", np.empty((0, 4))), dtype=float)
 
@@ -195,7 +240,7 @@ def write_telemetry_csv(
     interp_err = _interp_array(pos_err, t_eval, 3)
 
     rel_t = t_eval - t_eval[0]
-    data = np.column_stack([
+    columns = [
         rel_t,
         t_eval,
         interp_raw,
@@ -205,7 +250,7 @@ def write_telemetry_csv(
         interp_thrust,
         interp_torque,
         interp_err,
-    ])
+    ]
 
     headers = [
         "time_rel",
@@ -245,6 +290,12 @@ def write_telemetry_csv(
         "pos_err_z",
     ]
 
+    if ekf_diag.ndim == 2 and ekf_diag.shape[0] > 0:
+        columns.append(_resample_ekf_diag(ekf_diag, t_eval))
+        headers.extend(EKF_DIAG_CSV_HEADERS)
+
+    data = np.column_stack(columns)
+
     csv_path = os.path.join(dest, FILE_TELEMETRY_CSV)
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -263,6 +314,7 @@ def write_reports(
     samples: dict | None = None,
     gains: dict | None = None,
     pid_conf_path: str | None = None,
+    estimator_mode: str | None = None,
 ) -> dict:
     """Write one run's artefacts into ``<out_dir>/<config>/``.
 
@@ -277,7 +329,25 @@ def write_reports(
     dest = run_dir(out_dir, config)
     os.makedirs(dest, exist_ok=True)
 
-    report = {"config": config, "timestamps": ts, "metrics": metrics}
+    samples_dict = samples or {}
+    raw_mocap = np.asarray(samples_dict.get("raw_mocap", np.empty((0, 8))), dtype=float)
+    imu = np.asarray(samples_dict.get("imu", np.empty((0, 7))), dtype=float)
+    thrust = np.asarray(samples_dict.get("thrust", np.empty((0, 2))), dtype=float)
+    torque = np.asarray(samples_dict.get("torque", np.empty((0, 4))), dtype=float)
+    pos_err = np.asarray(samples_dict.get("pos_err", np.empty((0, 4))), dtype=float)
+    ekf_diag = np.asarray(
+        samples_dict.get("ekf_diag", np.empty((0, 1 + EKF_DIAG_NCOLS))), dtype=float
+    )
+    has_ekf_diag = bool(ekf_diag.ndim == 2 and ekf_diag.shape[0] > 0)
+
+    report = {
+        "config": config,
+        "ekf_oot_detected": has_ekf_diag,
+        "timestamps": ts,
+        "metrics": metrics,
+    }
+    if estimator_mode:
+        report["estimator_mode"] = estimator_mode
     if gains is not None:
         report["gains"] = gains
     if pid_conf_path:
@@ -291,15 +361,7 @@ def write_reports(
         writer.writeheader()
         writer.writerow(row)
 
-    samples_dict = samples or {}
-    raw_mocap = np.asarray(samples_dict.get("raw_mocap", np.empty((0, 8))), dtype=float)
-    imu = np.asarray(samples_dict.get("imu", np.empty((0, 7))), dtype=float)
-    thrust = np.asarray(samples_dict.get("thrust", np.empty((0, 2))), dtype=float)
-    torque = np.asarray(samples_dict.get("torque", np.empty((0, 4))), dtype=float)
-    pos_err = np.asarray(samples_dict.get("pos_err", np.empty((0, 4))), dtype=float)
-
-    np.savez(
-        os.path.join(dest, FILE_TRAJ_NPZ),
+    npz_payload = dict(
         odom=np.asarray(traj.get("odom", np.empty((0, 11))), dtype=float),
         setpoint=np.asarray(traj.get("setpoint", np.empty((0, 4))), dtype=float),
         raw_mocap=raw_mocap,
@@ -313,6 +375,10 @@ def write_reports(
         t_start=float(ts["t_start"]),
         t_land_end=float(ts["t_land_end"]),
     )
+    if has_ekf_diag:
+        npz_payload["ekf_diag"] = ekf_diag
+
+    np.savez(os.path.join(dest, FILE_TRAJ_NPZ), **npz_payload)
 
     # Export synchronized 50 Hz telemetry table to CSV
     write_telemetry_csv(dest, ts, traj, samples, dt=0.02)

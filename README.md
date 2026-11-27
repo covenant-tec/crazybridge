@@ -14,6 +14,14 @@ The bridge receives motion capture data from OptiTrack and forwards coordinates 
 * `marker`: Uses 3-DoF position coordinates from `optitrack/marker`.
 * `auto`: Default mode. Automatically selects between rigid body and single marker based on the incoming OptiTrack stream.
 
+## State Estimator Modes
+
+The bridge accepts an `estimator_mode` launch parameter to switch between the stock Bitcraze Extended Kalman Filter and an Out-Of-Tree EKF at startup without reflashing:
+
+* `oot`: Selects the Out-Of-Tree 13-state EKF via `ekfOot.useStock=0`, streams filter diagnostics on `/crazybridge/ekf_diag`, and appends the diagnostic columns to `flight_telemetry.csv`.
+* `stock`: Selects the stock Bitcraze Extended Kalman Filter via `ekfOot.useStock=1` on Out-Of-Tree firmware or `stabilizer.estimator=2` on standard firmware.
+* `auto`: Default mode. Uses the Out-Of-Tree EKF when `ekfOot` is present in the firmware table of contents and falls back to the stock Bitcraze Extended Kalman Filter otherwise.
+
 ## Configuration Files
 
 Controller gains and vehicle mass are configured through the following files:

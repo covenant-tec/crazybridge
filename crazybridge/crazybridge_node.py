@@ -32,10 +32,16 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Imu
-from std_msgs.msg import Float32, Header
+from std_msgs.msg import Float32, Float32MultiArray, Header
 from std_srvs.srv import SetBool
 
-from crazybridge.interface import BridgePublishers, Create, TrackingMode
+from crazybridge.interface import (
+    BridgePublishers,
+    Create,
+    EkfOotDiag,
+    EstimatorMode,
+    TrackingMode,
+)
 from crazybridge.pid_conf import PidConf
 from crazybridge_interfaces.srv import GoTo, Land, Spiral, Takeoff
 
@@ -62,6 +68,7 @@ class CrazyBridge(Node):
         self.declare_parameter("log_period_ms", 50)
         self.declare_parameter("oot_log_period_ms", 10)
         self.declare_parameter("imu_log_period_ms", 50)
+        self.declare_parameter("ekf_log_period_ms", 20)
         self.declare_parameter("connection_timeout_s", 10.0)
         self.declare_parameter("odom_frame_id", "world")
         self.declare_parameter("child_frame_id", "crazyflie")
@@ -69,6 +76,7 @@ class CrazyBridge(Node):
         self.declare_parameter("load_pid_conf", True)
         self.declare_parameter("max_distance_from_origin", 3.0)
         self.declare_parameter("tracking_mode", TrackingMode.RIGID_BODY)
+        self.declare_parameter("estimator_mode", EstimatorMode.AUTO)
         self.declare_parameter("rigid_body_id", "")
         self.declare_parameter("marker_id", "")
 
@@ -89,6 +97,10 @@ class CrazyBridge(Node):
         self._imu_log_period_ms = self._sanitise_log_period(
             self.get_parameter("imu_log_period_ms").get_parameter_value().integer_value,
             "imu_log_period_ms",
+        )
+        self._ekf_log_period_ms = self._sanitise_log_period(
+            self.get_parameter("ekf_log_period_ms").get_parameter_value().integer_value,
+            "ekf_log_period_ms",
         )
         self._odom_frame = (
             self.get_parameter("odom_frame_id").get_parameter_value().string_value
@@ -115,6 +127,25 @@ class CrazyBridge(Node):
             )
             self._tracking_mode = TrackingMode.RIGID_BODY
         self.get_logger().info(f"Configured tracking mode: {self._tracking_mode}")
+
+        est_mode_raw = (
+            self.get_parameter("estimator_mode")
+            .get_parameter_value()
+            .string_value.strip()
+            .lower()
+        )
+        if est_mode_raw in (
+            EstimatorMode.AUTO,
+            EstimatorMode.OOT,
+            EstimatorMode.STOCK,
+        ):
+            self._estimator_mode = est_mode_raw
+        else:
+            self.get_logger().warning(
+                f"Unknown estimator_mode={est_mode_raw!r}; defaulting to {EstimatorMode.AUTO}"
+            )
+            self._estimator_mode = EstimatorMode.AUTO
+        self.get_logger().info(f"Configured estimator mode: {self._estimator_mode}")
 
         rigid_id_raw = (
             self.get_parameter("rigid_body_id")
@@ -150,6 +181,7 @@ class CrazyBridge(Node):
         self._oot_pos_err = (0.0, 0.0, 0.0)
         self._oot_q_err = (0.0, 0.0, 0.0, 1.0)  # (x, y, z, w)
         self._oot_qd = (0.0, 0.0, 0.0, 1.0)  # (x, y, z, w)
+        self._ekf_oot_log: LogConfig | None = None
 
         self._safe_to_fly: bool = False
         self._bad_mocap_counter: int = 0
@@ -309,26 +341,99 @@ class CrazyBridge(Node):
                         "[AUTO MODE] Radio connected. Waiting to detect OptiTrack source "
                         "(marker vs rigid body) before applying PID gains..."
                     )
+        self._configure_estimator()
+        self._setup_core_logs()
+        self._setup_oot_logs()
+        self._setup_ekf_oot_logs()
+
+        self._connected.set()
+
+    def _has_log_group(self, group: str) -> bool:
+        """Return True if ``group`` is present in the connected Crazyflie's log TOC."""
+        toc = getattr(getattr(self._cf, "log", None), "toc", None)
+        toc_dict = getattr(toc, "toc", None)
+        return isinstance(toc_dict, dict) and group in toc_dict
+
+    def _has_log_var(self, group: str, name: str) -> bool:
+        """Return True if ``group.name`` is present in the connected Crazyflie's log TOC."""
+        toc = getattr(getattr(self._cf, "log", None), "toc", None)
+        toc_dict = getattr(toc, "toc", None)
+        if not isinstance(toc_dict, dict):
+            return False
+        return name in toc_dict.get(group, {})
+
+    def _has_param(self, group: str, name: str) -> bool:
+        """Return True if ``group.name`` is present in the connected Crazyflie's param TOC."""
+        toc = getattr(getattr(self._cf, "param", None), "toc", None)
+        toc_dict = getattr(toc, "toc", None)
+        if not isinstance(toc_dict, dict):
+            return False
+        return name in toc_dict.get(group, {})
+
+    def _configure_estimator(self) -> None:
+        """Enable high-level commander and select stock vs Out-Of-Tree EKF."""
+        has_custom_ekf = self._has_log_group(EkfOotDiag.LOG_GROUP)
+        has_stock_switch = self._has_param(EkfOotDiag.LOG_GROUP, "useStock")
+
         try:
             self._cf.param.set_value(PARAM_HL_COMMANDER, 1)
-            #            self._cf.param.set_value(PARAM_CONTROLLER, 5) # Add constats for the controller oot = 5 and auto = 0
-            self._cf.param.set_value(PARAM_ESTIMATOR, ESTIMATOR_KALMAN)
-        except Exception as exc:
-            self.get_logger().error(f"Failed to set startup params: {exc}")
 
-        self._pos_log = LogConfig(name="kalman_pos", period_in_ms=self._log_period_ms)
-        self._pos_log.add_variable("kalman.stateX", "float")
-        self._pos_log.add_variable("kalman.stateY", "float")
-        self._pos_log.add_variable("kalman.stateZ", "float")
+            if has_custom_ekf:
+                use_stock = self._estimator_mode == EstimatorMode.STOCK
+                if has_stock_switch:
+                    self._cf.param.set_value(
+                        EkfOotDiag.PARAM_USE_STOCK, 1 if use_stock else 0
+                    )
+                if use_stock:
+                    self.get_logger().info(
+                        "[ESTIMATOR] Selected STOCK Bitcraze Kalman filter "
+                        f"({EkfOotDiag.PARAM_USE_STOCK}=1)."
+                    )
+                else:
+                    self.get_logger().info(
+                        "[ESTIMATOR] Selected Out-Of-Tree 13-state EKF "
+                        f"({EkfOotDiag.PARAM_USE_STOCK}=0)."
+                    )
+            else:
+                self._cf.param.set_value(PARAM_ESTIMATOR, ESTIMATOR_KALMAN)
+                if self._estimator_mode == EstimatorMode.OOT:
+                    self.get_logger().warning(
+                        f"[ESTIMATOR] Requested 'oot', but {EkfOotDiag.LOG_GROUP!r} is "
+                        "not in firmware TOC; falling back to stock Kalman estimator."
+                    )
+                else:
+                    self.get_logger().info(
+                        "[ESTIMATOR] Standard firmware detected; enabled stock Kalman estimator."
+                    )
+        except Exception as exc:
+            self.get_logger().error(f"Failed to set startup estimator params: {exc}")
+
+    def _setup_core_logs(self) -> None:
+        """Register estimator-agnostic state, IMU, battery, and setpoint CRTP logs."""
+        self._pos_log = LogConfig(name="state_pos", period_in_ms=self._log_period_ms)
+        if self._has_log_var("stateEstimate", "x"):
+            self._pos_log.add_variable("stateEstimate.x", "float")
+            self._pos_log.add_variable("stateEstimate.y", "float")
+            self._pos_log.add_variable("stateEstimate.z", "float")
+        else:
+            self._pos_log.add_variable("kalman.stateX", "float")
+            self._pos_log.add_variable("kalman.stateY", "float")
+            self._pos_log.add_variable("kalman.stateZ", "float")
         self._pos_log.add_variable("stateEstimate.vx", "float")
         self._pos_log.add_variable("stateEstimate.vy", "float")
         self._pos_log.add_variable("stateEstimate.vz", "float")
 
-        self._q_log = LogConfig(name="kalman_q", period_in_ms=self._log_period_ms)
-        self._q_log.add_variable("kalman.q0", "float")
-        self._q_log.add_variable("kalman.q1", "float")
-        self._q_log.add_variable("kalman.q2", "float")
-        self._q_log.add_variable("kalman.q3", "float")
+        self._q_log = LogConfig(name="state_quat", period_in_ms=self._log_period_ms)
+        if self._has_log_var("stateEstimate", "qx"):
+            self._q_log.add_variable("stateEstimate.qx", "float")
+            self._q_log.add_variable("stateEstimate.qy", "float")
+            self._q_log.add_variable("stateEstimate.qz", "float")
+            self._q_log.add_variable("stateEstimate.qw", "float")
+        else:
+            self._q_log.add_variable("kalman.q0", "float")
+            self._q_log.add_variable("kalman.q1", "float")
+            self._q_log.add_variable("kalman.q2", "float")
+            self._q_log.add_variable("kalman.q3", "float")
 
         self._imu_log = LogConfig(name="imu_raw", period_in_ms=self._imu_log_period_ms)
         self._imu_log.add_variable("acc.x", "float")
@@ -342,11 +447,6 @@ class CrazyBridge(Node):
         self._pm_log = LogConfig(name="battery", period_in_ms=extra_period)
         self._pm_log.add_variable("pm.batteryLevel", "uint8_t")
 
-        # ctrltarget.* is the controller's desired position (the planned
-        # trajectory the high-level commander is driving toward). It is a core
-        # firmware log group, so it is populated regardless of which controller
-        # or gain set is active -- ideal as the reference to compare the flown
-        # path against.
         self._setpoint_log = LogConfig(
             name="ctrltarget", period_in_ms=self._log_period_ms
         )
@@ -373,9 +473,30 @@ class CrazyBridge(Node):
         except Exception as exc:
             self.get_logger().error(f"Failed to register log blocks: {exc}")
 
-        self._setup_oot_logs()
+    def _setup_ekf_oot_logs(self) -> None:
+        """Optionally subscribe to Out-Of-Tree EKF diagnostics (``ekfOot.*``)."""
+        if not self._has_log_group(EkfOotDiag.LOG_GROUP):
+            self._ekf_oot_log = None
+            return
 
-        self._connected.set()
+        ekf_log = LogConfig(name="ekf_oot", period_in_ms=self._ekf_log_period_ms)
+        for var_name, var_type, _, _ in EkfOotDiag.FIELDS:
+            ekf_log.add_variable(f"{EkfOotDiag.LOG_GROUP}.{var_name}", var_type)
+
+        try:
+            self._cf.log.add_config(ekf_log)
+            ekf_log.data_received_cb.add_callback(self._on_ekf_oot_log)
+            ekf_log.start()
+            self._ekf_oot_log = ekf_log
+            self.get_logger().info(
+                f"Out-Of-Tree EKF diagnostics block ({EkfOotDiag.LOG_GROUP!r}) started "
+                f"at {self._ekf_log_period_ms} ms"
+            )
+        except Exception as exc:
+            self._ekf_oot_log = None
+            self.get_logger().warning(
+                f"Failed to register optional {EkfOotDiag.LOG_GROUP!r} log block: {exc}"
+            )
 
     def _setup_oot_logs(self) -> None:
         period = self._oot_log_period_ms
@@ -625,11 +746,18 @@ class CrazyBridge(Node):
 
     def _on_pos_log(self, _timestamp, data, _logconf) -> None:
         with self._pos_lock:
-            self._pos = [
-                float(data["kalman.stateX"]),
-                float(data["kalman.stateY"]),
-                float(data["kalman.stateZ"]),
-            ]
+            if "stateEstimate.x" in data:
+                self._pos = [
+                    float(data["stateEstimate.x"]),
+                    float(data["stateEstimate.y"]),
+                    float(data["stateEstimate.z"]),
+                ]
+            else:
+                self._pos = [
+                    float(data["kalman.stateX"]),
+                    float(data["kalman.stateY"]),
+                    float(data["kalman.stateZ"]),
+                ]
             self._vel = [
                 float(data.get("stateEstimate.vx", 0.0)),
                 float(data.get("stateEstimate.vy", 0.0)),
@@ -651,16 +779,28 @@ class CrazyBridge(Node):
         self._pubs.imu.publish(msg)
 
     def _on_q_log(self, _timestamp, data, _logconf) -> None:
-        # Bitcraze kalman logs (q0, q1, q2, q3) as (w, x, y, z).
-        x, y, z, w = self._normalize_quat(
-            float(data["kalman.q1"]),
-            float(data["kalman.q2"]),
-            float(data["kalman.q3"]),
-            float(data["kalman.q0"]),
-        )
+        if "stateEstimate.qx" in data:
+            raw_x = float(data["stateEstimate.qx"])
+            raw_y = float(data["stateEstimate.qy"])
+            raw_z = float(data["stateEstimate.qz"])
+            raw_w = float(data["stateEstimate.qw"])
+        else:
+            raw_x = float(data["kalman.q1"])
+            raw_y = float(data["kalman.q2"])
+            raw_z = float(data["kalman.q3"])
+            raw_w = float(data["kalman.q0"])
+        x, y, z, w = self._normalize_quat(raw_x, raw_y, raw_z, raw_w)
         with self._pos_lock:
             self._quat = [x, y, z, w]
         self._publish_odom()
+
+    def _on_ekf_oot_log(self, _timestamp, data, _logconf) -> None:
+        msg = Float32MultiArray()
+        msg.data = [
+            float(data[f"{EkfOotDiag.LOG_GROUP}.{var_name}"])
+            for var_name, _, _, _ in EkfOotDiag.FIELDS
+        ]
+        self._pubs.ekf_diag.publish(msg)
 
     def _on_pos_err_log(self, _timestamp, data, _logconf) -> None:
         v = (
@@ -888,11 +1028,14 @@ class CrazyBridge(Node):
             "_pos_log",
             "_q_log",
             "_imu_log",
+            "_pm_log",
             "_setpoint_log",
+            "_input_log",
             "_pos_err_log",
             "_q_err_log",
             "_qd_log",
             "_ang_vel_err_log",
+            "_ekf_oot_log",
         ):
             log = getattr(self, name, None)
             if log is None:

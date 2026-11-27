@@ -25,7 +25,7 @@ from geometry_msgs.msg import Point, PointStamped, Quaternion, Vector3
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import Imu
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Float32MultiArray
 from std_srvs.srv import SetBool
 
 from crazybridge_interfaces.srv import GoTo, Land, Spiral, Takeoff
@@ -40,12 +40,46 @@ class TrackingMode:
     MARKER = "marker"
 
 
+class EstimatorMode:
+    """Supported onboard state estimator selection modes."""
+    AUTO = "auto"
+    OOT = "oot"
+    STOCK = "stock"
+
+
+class EkfOotDiag:
+    """CRTP and ROS 2 schema for Out-Of-Tree EKF control and diagnostics.
+
+    Published on ``Topics.EKF_DIAG`` (``std_msgs/Float32MultiArray``) only when
+    the connected Crazyflie exposes the ``ekfOot`` log group in its TOC. When
+    flying stock Bitcraze / lab firmware, the topic stays silent and CSV exports
+    preserve their original 35-column layout.
+    """
+
+    LOG_GROUP = "ekfOot"
+    PARAM_USE_STOCK = "ekfOot.useStock"
+
+    # Ordered tuple of (crtp_var_name, cflib_type, rerun_entity_path, rgb_color).
+    # Total CRTP payload: 4 + 4 + 2 + 2 + 1 + 4 + 4 = 21 bytes (<= 26 B limit).
+    FIELDS = (
+        ("dMahal", "float", "/ekf_oot/d_mahal", [255, 165, 0]),
+        ("trP", "float", "/ekf_oot/tr_p", [0, 200, 255]),
+        ("cholFails", "uint16_t", "/ekf_oot/chol_fails", [255, 60, 60]),
+        ("nanResets", "uint16_t", "/ekf_oot/nan_resets", [255, 0, 180]),
+        ("flags", "uint8_t", "/ekf_oot/flags", [120, 255, 120]),
+        ("rtPred", "float", "/ekf_oot/rt_pred", [180, 180, 255]),
+        ("rtUpd", "float", "/ekf_oot/rt_upd", [255, 220, 100]),
+    )
+    NUM_FIELDS = len(FIELDS)
+
+
 class Create:
     """Names the bridge node passes to create_publisher / create_service."""
 
     ODOM = "~/odometry"
     IMU = "~/imu"
     BATTERY = "~/battery"
+    EKF_DIAG = "~/ekf_diag"
     THRUST = "thrust"
     TORQUE = "torque"
     POS_ERROR = "pos_error"
@@ -67,6 +101,7 @@ class Topics:
     ODOM = "/crazybridge/odometry"
     IMU = "/crazybridge/imu"
     BATTERY = "/crazybridge/battery"
+    EKF_DIAG = "/crazybridge/ekf_diag"
     THRUST = "/thrust"
     TORQUE = "/torque"
     POS_ERROR = "/pos_error"
@@ -113,6 +148,7 @@ class BridgePublishers:
         )
         self.orientation_error = node.create_publisher(Quaternion, Create.ORI_ERROR, 1)
         self.imu = node.create_publisher(Imu, Create.IMU, 10)
+        self.ekf_diag = node.create_publisher(Float32MultiArray, Create.EKF_DIAG, 10)
 
 
 class BridgeClientNode(Node):

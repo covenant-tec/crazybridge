@@ -2,11 +2,13 @@ from rerun_sdk import rerun as rr
 import rclpy
 import numpy as np
 from rclpy.node import Node
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Float32MultiArray
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
 from scipy.spatial.transform import Rotation
 from geometry_msgs.msg import Vector3, Quaternion, PoseWithCovariance, Pose, Point, PointStamped
+
+from crazybridge.interface import EkfOotDiag, Topics
 
 class Rerun(Node):
     def __init__(self):
@@ -35,6 +37,7 @@ class Rerun(Node):
         # 3D line strips so the tracking can be seen live and side by side.
         self._planned_path: list[list[float]] = []
         self._actual_path: list[list[float]] = []
+        self._ekf_series_initialized: bool = False
 
         self._init_rerun()
         self._init_error_logs()
@@ -45,9 +48,12 @@ class Rerun(Node):
         self.create_subscription(Float32, 'thrust', self._thrust_cb, 1)
         self.create_subscription(Quaternion, 'orientation/desired', self._qd_cb, 1)
         self.create_subscription(Quaternion, 'orientation/error', self._qe_cb, 1)
-        self.create_subscription(Odometry, '/crazybridge/odometry', self._odometry_cb, 1)
-        self.create_subscription(Imu, '/crazybridge/imu', self._imu_cb, 10)
+        self.create_subscription(Odometry, Topics.ODOM, self._odometry_cb, 1)
+        self.create_subscription(Imu, Topics.IMU, self._imu_cb, 10)
         self.create_subscription(PointStamped, 'setpoint', self._setpoint_cb, 1)
+        self.create_subscription(
+            Float32MultiArray, Topics.EKF_DIAG, self._ekf_diag_cb, 10
+        )
 
     @staticmethod
     def _normalize_quat(q: Quaternion) -> tuple[float, float, float, float]:
@@ -94,6 +100,16 @@ class Rerun(Node):
         rr.log("/imu/gyro/x", rr.Scalars(msg.angular_velocity.x))
         rr.log("/imu/gyro/y", rr.Scalars(msg.angular_velocity.y))
         rr.log("/imu/gyro/z", rr.Scalars(msg.angular_velocity.z))
+
+    def _ekf_diag_cb(self, msg: Float32MultiArray):
+        """Plot optional Out-Of-Tree EKF diagnostics only when published."""
+        if len(msg.data) < EkfOotDiag.NUM_FIELDS:
+            return
+        if not self._ekf_series_initialized:
+            self._init_ekf_logs()
+            self._ekf_series_initialized = True
+        for (_, _, entity_path, _), val in zip(EkfOotDiag.FIELDS, msg.data):
+            rr.log(entity_path, rr.Scalars(float(val)))
 
     def _pos_err_cb(self, msg: Vector3):
         if abs(msg.x) > 3:
@@ -226,6 +242,17 @@ class Rerun(Node):
             ),
             static=True,
         )
+
+    def _init_ekf_logs(self):
+        for var_name, _, entity_path, color in EkfOotDiag.FIELDS:
+            rr.log(
+                entity_path,
+                rr.SeriesLines(colors=color, names=var_name),
+                static=True,
+            )
+
+    def shutdown(self) -> None:
+        """Clean shutdown hook called by ``main``."""
 
 
     def _init_rerun(self) -> None:

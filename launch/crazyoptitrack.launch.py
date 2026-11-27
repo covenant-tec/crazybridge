@@ -14,6 +14,11 @@ def generate_launch_description() -> LaunchDescription:
         default_value="auto",
         description="Mocap tracking mode: 'rigid_body' (6-DoF), 'marker' (single-ball 3-DoF), or 'auto'.",
     )
+    estimator_mode_arg = DeclareLaunchArgument(
+        "estimator_mode",
+        default_value="auto",
+        description="State estimator mode: 'oot' (13-state OOT EKF), 'stock' (Bitcraze Kalman), or 'auto'.",
+    )
     uri_arg = DeclareLaunchArgument(
         "uri",
         default_value="radio://0/80/2M/E7E7E7E7E7",
@@ -76,6 +81,7 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
             tracking_mode_arg,
+            estimator_mode_arg,
             uri_arg,
             log_period_arg,
             oot_log_period_arg,
@@ -94,6 +100,7 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         "uri": LaunchConfiguration("uri"),
                         "tracking_mode": LaunchConfiguration("tracking_mode"),
+                        "estimator_mode": LaunchConfiguration("estimator_mode"),
                         "log_period_ms": LaunchConfiguration("log_period_ms"),
                         "oot_log_period_ms": LaunchConfiguration("oot_log_period_ms"),
                         "pid_conf_path": LaunchConfiguration("pid_conf_path"),

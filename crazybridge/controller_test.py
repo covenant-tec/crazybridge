@@ -45,13 +45,19 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import PointStamped, PoseStamped, Vector3
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Float32MultiArray
 
 from crazybridge import metrics
 from ament_index_python.packages import get_package_share_directory
 import os
 
-from crazybridge.interface import BridgeClientNode, Topics, TrackingMode
+from crazybridge.interface import (
+    BridgeClientNode,
+    EkfOotDiag,
+    EstimatorMode,
+    Topics,
+    TrackingMode,
+)
 from crazybridge.pid_conf import PidConf
 
 
@@ -69,6 +75,7 @@ class ControllerTest(BridgeClientNode):
         # a run's numbers can be traced back to the gains that produced them.
         self.declare_parameter("pid_conf_path", "")
         self.declare_parameter("tracking_mode", TrackingMode.AUTO)
+        self.declare_parameter("estimator_mode", EstimatorMode.AUTO)
 
         # telemetry topic names (odom_topic comes from the base)
         self.declare_parameter("setpoint_topic", Topics.SETPOINT)
@@ -76,6 +83,7 @@ class ControllerTest(BridgeClientNode):
         self.declare_parameter("torque_topic", Topics.TORQUE)
         self.declare_parameter("pos_error_topic", Topics.POS_ERROR)
         self.declare_parameter("imu_topic", Topics.IMU)
+        self.declare_parameter("ekf_diag_topic", Topics.EKF_DIAG)
         self.declare_parameter("rigid_body_topic", Topics.RIGID_BODY)
         self.declare_parameter("marker_topic", Topics.MARKER)
 
@@ -106,6 +114,7 @@ class ControllerTest(BridgeClientNode):
         self._raw_mocap: list[list[float]] = []
         self._raw_mocap_source: str = "none"
         self._imu: list[list[float]] = []
+        self._ekf_diag: list[list[float]] = []
 
         self.create_subscription(Float32, self._sp("thrust_topic"), self._thrust_cb, 50)
         self.create_subscription(Vector3, self._sp("torque_topic"), self._torque_cb, 50)
@@ -116,6 +125,9 @@ class ControllerTest(BridgeClientNode):
             PointStamped, self._sp("setpoint_topic"), self._setpoint_cb, 50
         )
         self.create_subscription(Imu, self._sp("imu_topic"), self._imu_cb, 50)
+        self.create_subscription(
+            Float32MultiArray, self._sp("ekf_diag_topic"), self._ekf_diag_cb, 50
+        )
         qos_best_effort = QoSProfile(
             depth=10, reliability=ReliabilityPolicy.BEST_EFFORT
         )
@@ -167,6 +179,15 @@ class ControllerTest(BridgeClientNode):
                 msg.angular_velocity.x,
                 msg.angular_velocity.y,
                 msg.angular_velocity.z,
+            ])
+
+    def _ekf_diag_cb(self, msg: Float32MultiArray) -> None:
+        if len(msg.data) < EkfOotDiag.NUM_FIELDS:
+            return
+        with self._lock:
+            self._ekf_diag.append([
+                self._now(),
+                *(float(v) for v in msg.data[: EkfOotDiag.NUM_FIELDS]),
             ])
 
     def _rigid_body_cb(self, msg: PoseStamped) -> None:
@@ -321,6 +342,9 @@ class ControllerTest(BridgeClientNode):
                 "raw_mocap": np.array(self._raw_mocap, dtype=float)
                 if self._raw_mocap
                 else np.empty((0, 8)),
+                "ekf_diag": np.array(self._ekf_diag, dtype=float)
+                if self._ekf_diag
+                else np.empty((0, 1 + EkfOotDiag.NUM_FIELDS)),
             }
 
     def _traj(self) -> dict:
@@ -386,6 +410,7 @@ class ControllerTest(BridgeClientNode):
             samples=samples,
             gains=gains,
             pid_conf_path=pid_conf_path,
+            estimator_mode=self._sp("estimator_mode"),
         )
         self.get_logger().info(
             f"wrote run artefacts to {metrics.run_dir(out_dir, config)}"

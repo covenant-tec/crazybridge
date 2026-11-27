@@ -44,6 +44,9 @@ def generate_launch_description() -> LaunchDescription:
             'tracking_mode', default_value='auto',
             description="Mocap tracking mode: 'rigid_body' (6-DoF), 'marker' (single-ball 3-DoF), or 'auto'."),
         DeclareLaunchArgument(
+            'estimator_mode', default_value='auto',
+            description="State estimator mode: 'oot' (13-state OOT EKF), 'stock' (Bitcraze Kalman), or 'auto'."),
+        DeclareLaunchArgument(
             'pid_conf_path', default_value='',
             description='OOT gain file to load for this run (empty = auto-resolve based on tracking_mode).'),
         DeclareLaunchArgument(
@@ -87,6 +90,7 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[{
             'uri': LaunchConfiguration('uri'),
             'tracking_mode': LaunchConfiguration('tracking_mode'),
+            'estimator_mode': LaunchConfiguration('estimator_mode'),
             'pid_conf_path': LaunchConfiguration('pid_conf_path'),
             'load_pid_conf': True,
         }],
@@ -120,6 +124,7 @@ def generate_launch_description() -> LaunchDescription:
             # Same gain file the bridge loads; recorded with the metrics.
             'pid_conf_path': LaunchConfiguration('pid_conf_path'),
             'tracking_mode': LaunchConfiguration('tracking_mode'),
+            'estimator_mode': LaunchConfiguration('estimator_mode'),
             'takeoff_height_m': LaunchConfiguration('takeoff_height_m'),
             'goal_xyz': LaunchConfiguration('goal_xyz'),
             'circle_radius_m': LaunchConfiguration('circle_radius_m'),
