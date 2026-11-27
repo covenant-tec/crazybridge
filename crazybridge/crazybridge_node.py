@@ -9,6 +9,7 @@ drive the high-level commander.
 
 from __future__ import annotations
 
+from collections import deque
 import math
 import os
 import threading
@@ -42,6 +43,7 @@ from crazybridge.interface import (
     BridgePublishers,
     Create,
     EkfAdaptDiag,
+    EkfBiasDiag,
     EkfOotDiag,
     EstimatorMode,
     TrackingMode,
@@ -57,6 +59,17 @@ PARAM_CONTROLLER = "stabilizer.controller"
 ESTIMATOR_KALMAN = 2
 ESTIMATOR_COMPLEMENTARY = 1
 
+# Matches Crazyflie firmware GRAVITY_MAGNITUDE = 9.81f (physicalConstants.h)
+# and EKF_GRAVITY_Z = -9.81f so `imu_a - imu_bias_a` equals `[0, 0, +9.81]` m/s^2
+# at level rest with zero scaling offset.
+GRAVITY_MPS2 = 9.81
+STILLNESS_MAX_GYRO_RAD_S = 0.20
+STILLNESS_MAX_ACC_DEV_MPS2 = 1.00
+STILLNESS_MAX_TILT_ACC_MPS2 = 1.50
+STILLNESS_WINDOW_SAMPLES = 25
+STILLNESS_MIN_SAMPLES = 5
+STILLNESS_MAX_AGE_S = 1.0
+
 # The ootParams gain names live in crazybridge.pid_conf.LAYOUT.
 
 
@@ -71,8 +84,9 @@ class CrazyBridge(Node):
         # i.e. 50 ms for pos/q and 10 ms for the OOT blocks.
         self.declare_parameter("log_period_ms", 50)
         self.declare_parameter("oot_log_period_ms", 10)
-        self.declare_parameter("imu_log_period_ms", 50)
+        self.declare_parameter("imu_log_period_ms", 20)
         self.declare_parameter("ekf_log_period_ms", 20)
+        self.declare_parameter("bias_log_period_ms", 500)
         self.declare_parameter("connection_timeout_s", 10.0)
         self.declare_parameter("odom_frame_id", "world")
         self.declare_parameter("child_frame_id", "crazyflie")
@@ -110,6 +124,10 @@ class CrazyBridge(Node):
         self._ekf_log_period_ms = self._sanitise_log_period(
             self.get_parameter("ekf_log_period_ms").get_parameter_value().integer_value,
             "ekf_log_period_ms",
+        )
+        self._bias_log_period_ms = self._sanitise_log_period(
+            self.get_parameter("bias_log_period_ms").get_parameter_value().integer_value,
+            "bias_log_period_ms",
         )
         self._odom_frame = (
             self.get_parameter("odom_frame_id").get_parameter_value().string_value
@@ -225,6 +243,18 @@ class CrazyBridge(Node):
         self._oot_qd = (0.0, 0.0, 0.0, 1.0)  # (x, y, z, w)
         self._ekf_oot_log: LogConfig | None = None
         self._ekf_adapt_log: LogConfig | None = None
+        self._ekf_bias_log: LogConfig | None = None
+
+        # Stationary IMU bias calibration & pre-takeoff stillness state.
+        self._bias_lock = threading.Lock()
+        self._has_ekf_oot_group: bool = False
+        self._has_ekf_bias_group: bool = False
+        self._latest_ekf_flags: int = 0
+        self._ekf_bias_ready: bool = False
+        self._latest_imu_bias: tuple[float, float, float, float, float, float] | None = None
+        self._recent_imu: deque[
+            tuple[float, float, float, float, float, float, float]
+        ] = deque(maxlen=STILLNESS_WINDOW_SAMPLES)
 
         self._safe_to_fly: bool = False
         self._bad_mocap_counter: int = 0
@@ -389,6 +419,7 @@ class CrazyBridge(Node):
         self._setup_core_logs()
         self._setup_oot_logs()
         self._setup_ekf_oot_logs()
+        self._setup_ekf_bias_logs()
         self._setup_ekf_adapt_logs()
 
         self._connected.set()
@@ -441,7 +472,11 @@ class CrazyBridge(Node):
     def _configure_estimator(self) -> None:
         """Enable high-level commander and select stock vs Out-Of-Tree EKF + adaptation mode."""
         has_custom_ekf = self._has_log_group(EkfOotDiag.LOG_GROUP)
+        has_bias_group = self._has_log_group(EkfBiasDiag.LOG_GROUP)
         has_stock_switch = self._has_param(EkfOotDiag.LOG_GROUP, "useStock")
+        with self._bias_lock:
+            self._has_ekf_oot_group = has_custom_ekf
+            self._has_ekf_bias_group = has_bias_group
 
         try:
             self._cf.param.set_value(PARAM_HL_COMMANDER, 1)
@@ -455,7 +490,7 @@ class CrazyBridge(Node):
                 if use_stock:
                     self.get_logger().info(
                         "[ESTIMATOR] Selected STOCK Bitcraze Kalman filter "
-                        f"({EkfOotDiag.PARAM_USE_STOCK}=1)."
+                        f"({EkfOotDiag.PARAM_USE_STOCK}=1, adapt_mode={self._adapt_mode!r})."
                     )
                     if self._adapt_mode != AdaptMode.STATIC:
                         self.get_logger().warning(
@@ -463,7 +498,12 @@ class CrazyBridge(Node):
                             "estimator_mode='stock'. Pass estimator_mode:=oot to activate the custom AEKF."
                         )
                 else:
-                    if self._load_adapt_conf and self._adapt_conf_path:
+                    if self._adapt_mode == AdaptMode.STATIC:
+                        self.get_logger().info(
+                            "[ESTIMATOR] adapt_mode='static': skipping adapt_policies.conf "
+                            "upload (using fixed Q_base / R_base)."
+                        )
+                    elif self._load_adapt_conf and self._adapt_conf_path:
                         try:
                             self._apply_adapt_conf(self._adapt_conf_path)
                         except Exception as exc:
@@ -566,7 +606,10 @@ class CrazyBridge(Node):
 
         if reconfigure and self._cf.is_connected():
             self._configure_estimator()
-            if self._estimator_mode == EstimatorMode.STOCK:
+            if (
+                self._estimator_mode == EstimatorMode.STOCK
+                or self._adapt_mode == AdaptMode.STATIC
+            ):
                 if self._ekf_adapt_log is not None:
                     try:
                         self._ekf_adapt_log.stop()
@@ -670,9 +713,42 @@ class CrazyBridge(Node):
                 f"Failed to register optional {EkfOotDiag.LOG_GROUP!r} log block: {exc}"
             )
 
+    def _setup_ekf_bias_logs(self) -> None:
+        """Subscribe to calibrated stationary IMU bias (``ekfBias.*``) at low rate.
+
+        Runs in both ``stock`` and ``oot`` estimator modes so comparison flights
+        with the stock Bitcraze Kalman filter also record calibrated IMU bias
+        for offline policy training without taxing CRTP radio bandwidth.
+        """
+        if not self._has_log_group(EkfBiasDiag.LOG_GROUP):
+            self._ekf_bias_log = None
+            return
+
+        bias_log = LogConfig(name="ekf_bias", period_in_ms=self._bias_log_period_ms)
+        for var_name, var_type, _, _ in EkfBiasDiag.FIELDS:
+            bias_log.add_variable(f"{EkfBiasDiag.LOG_GROUP}.{var_name}", var_type)
+
+        try:
+            self._cf.log.add_config(bias_log)
+            bias_log.data_received_cb.add_callback(self._on_ekf_bias_log)
+            bias_log.start()
+            self._ekf_bias_log = bias_log
+            self.get_logger().info(
+                f"Stationary IMU bias block ({EkfBiasDiag.LOG_GROUP!r}, 24 B) started "
+                f"at {self._bias_log_period_ms} ms"
+            )
+        except Exception as exc:
+            self._ekf_bias_log = None
+            self.get_logger().warning(
+                f"Failed to register optional {EkfBiasDiag.LOG_GROUP!r} log block: {exc}"
+            )
+
     def _setup_ekf_adapt_logs(self) -> None:
         """Optionally subscribe to Adaptive EKF decision telemetry (``ekfAdapt.*``)."""
-        if self._estimator_mode == EstimatorMode.STOCK:
+        if (
+            self._estimator_mode == EstimatorMode.STOCK
+            or self._adapt_mode == AdaptMode.STATIC
+        ):
             self._ekf_adapt_log = None
             return
         if not self._has_log_group(EkfAdaptDiag.LOG_GROUP):
@@ -969,16 +1045,29 @@ class CrazyBridge(Node):
         self._publish_odom()
 
     def _on_imu_log(self, _timestamp, data, _logconf) -> None:
+        # Firmware logs `acc` in Gs (scaled with GRAVITY_MAGNITUDE = 9.81 m/s^2 in
+        # FLU body frame) and `gyro` in deg/s (converted to rad/s in FLU body frame),
+        # matching `ekfBias` exactly so `imu - imu_bias` gives `[0, 0, +9.81]` m/s^2
+        # and `[0, 0, 0]` rad/s at level rest.
+        ax = float(data["acc.x"]) * GRAVITY_MPS2
+        ay = float(data["acc.y"]) * GRAVITY_MPS2
+        az = float(data["acc.z"]) * GRAVITY_MPS2
+        gx = math.radians(float(data["gyro.x"]))
+        gy = math.radians(float(data["gyro.y"]))
+        gz = math.radians(float(data["gyro.z"]))
+
+        with self._bias_lock:
+            self._recent_imu.append((time(), ax, ay, az, gx, gy, gz))
+
         msg = Imu()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self._child_frame
-        # acc in Gs (1G = 9.80665 m/s^2), gyro in deg/s (convert to rad/s)
-        msg.linear_acceleration.x = float(data["acc.x"]) * 9.80665
-        msg.linear_acceleration.y = float(data["acc.y"]) * 9.80665
-        msg.linear_acceleration.z = float(data["acc.z"]) * 9.80665
-        msg.angular_velocity.x = math.radians(float(data["gyro.x"]))
-        msg.angular_velocity.y = math.radians(float(data["gyro.y"]))
-        msg.angular_velocity.z = math.radians(float(data["gyro.z"]))
+        msg.linear_acceleration.x = ax
+        msg.linear_acceleration.y = ay
+        msg.linear_acceleration.z = az
+        msg.angular_velocity.x = gx
+        msg.angular_velocity.y = gy
+        msg.angular_velocity.z = gz
         self._pubs.imu.publish(msg)
 
     def _on_q_log(self, _timestamp, data, _logconf) -> None:
@@ -998,12 +1087,35 @@ class CrazyBridge(Node):
         self._publish_odom()
 
     def _on_ekf_oot_log(self, _timestamp, data, _logconf) -> None:
+        flags = int(round(float(data[f"{EkfOotDiag.LOG_GROUP}.flags"])))
+        with self._bias_lock:
+            self._latest_ekf_flags = flags
+            self._ekf_bias_ready = bool(flags & EkfOotDiag.FLAG_BIAS_READY)
+
         msg = Float32MultiArray()
         msg.data = [
             float(data[f"{EkfOotDiag.LOG_GROUP}.{var_name}"])
             for var_name, _, _, _ in EkfOotDiag.FIELDS
         ]
         self._pubs.ekf_diag.publish(msg)
+
+    def _on_ekf_bias_log(self, _timestamp, data, _logconf) -> None:
+        vals = tuple(
+            float(data[f"{EkfBiasDiag.LOG_GROUP}.{var_name}"])
+            for var_name, _, _, _ in EkfBiasDiag.FIELDS
+        )
+        if not all(math.isfinite(v) for v in vals):
+            return
+        with self._bias_lock:
+            # Never publish pre-calibration [0,0,0,0,0,0] while bit0 is still 0,
+            # so CSV/JSON record NaN/None if calibration has not finished.
+            if self._has_ekf_oot_group and not self._ekf_bias_ready:
+                return
+            self._latest_imu_bias = vals  # type: ignore[assignment]
+
+        msg = Float32MultiArray()
+        msg.data = list(vals)
+        self._pubs.imu_bias.publish(msg)
 
     def _on_ekf_adapt_log(self, _timestamp, data, _logconf) -> None:
         msg = Float32MultiArray()
@@ -1108,6 +1220,68 @@ class CrazyBridge(Node):
     def _duration_to_seconds(duration) -> float:
         return float(duration.sec) + float(duration.nanosec) * 1e-9
 
+    def check_pre_takeoff_readiness(self) -> tuple[bool, str]:
+        """Verify IMU bias calibration completed (`bit0` of `ekf_flags`) and drone stillness."""
+        now = time()
+        with self._bias_lock:
+            has_ekf_oot = self._has_ekf_oot_group
+            has_ekf_bias = self._has_ekf_bias_group
+            bias_ready = self._ekf_bias_ready
+            flags = self._latest_ekf_flags
+            bias = self._latest_imu_bias
+            recent_imu = [
+                s for s in self._recent_imu if (now - s[0]) <= STILLNESS_MAX_AGE_S
+            ]
+
+        if has_ekf_oot and not bias_ready:
+            return (
+                False,
+                "IMU bias calibration not ready "
+                f"(ekf_flags=0x{flags:02x}, EKF_OOT_FLAG_BIAS_READY=0); "
+                "keep the drone stationary on level ground for >= 1.5 s",
+            )
+        if has_ekf_bias and bias is None:
+            return (
+                False,
+                "calibrated IMU bias packet (ekfBias) not yet received; wait >= 0.5 s",
+            )
+        if len(recent_imu) < STILLNESS_MIN_SAMPLES:
+            return (
+                False,
+                f"insufficient recent IMU samples to verify stillness ({len(recent_imu)}/{STILLNESS_MIN_SAMPLES})",
+            )
+
+        bax, bay, baz, bgx, bgy, bgz = bias if bias is not None else (0.0,) * 6
+        max_gyro = 0.0
+        max_acc_dev = 0.0
+        for _, ax, ay, az, gx, gy, gz in recent_imu:
+            acx, acy, acz = ax - bax, ay - bay, az - baz
+            gcx, gcy, gcz = gx - bgx, gy - bgy, gz - bgz
+            gyro_norm = math.sqrt(gcx * gcx + gcy * gcy + gcz * gcz)
+            acc_norm = math.sqrt(acx * acx + acy * acy + acz * acz)
+            acc_dev = abs(acc_norm - GRAVITY_MPS2)
+            max_gyro = max(max_gyro, gyro_norm)
+            max_acc_dev = max(max_acc_dev, acc_dev)
+            if (
+                abs(acx) > STILLNESS_MAX_TILT_ACC_MPS2
+                or abs(acy) > STILLNESS_MAX_TILT_ACC_MPS2
+                or acz < (GRAVITY_MPS2 - STILLNESS_MAX_TILT_ACC_MPS2)
+            ):
+                return (
+                    False,
+                    "drone is tilted or not upright on ground before takeoff "
+                    f"(a_corr=[{acx:.2f}, {acy:.2f}, {acz:.2f}] m/s^2)",
+                )
+
+        if max_gyro > STILLNESS_MAX_GYRO_RAD_S or max_acc_dev > STILLNESS_MAX_ACC_DEV_MPS2:
+            return (
+                False,
+                "drone was moving before takeoff "
+                f"(max ||gyro||={max_gyro:.3f} rad/s, max | ||acc||-9.81 |={max_acc_dev:.3f} m/s^2)",
+            )
+
+        return True, "ok"
+
     def _takeoff_cb(
         self, request: Takeoff.Request, response: Takeoff.Response
     ) -> Takeoff.Response:
@@ -1117,6 +1291,12 @@ class CrazyBridge(Node):
             self.get_logger().warning("takeoff refused: not safe to fly")
             response.success = False
             response.message = "not safe to fly"
+            return response
+        ready, reason = self.check_pre_takeoff_readiness()
+        if not ready:
+            self.get_logger().error(f"takeoff refused: {reason}")
+            response.success = False
+            response.message = reason
             return response
         duration = self._duration_to_seconds(request.duration)
         self.get_logger().info(
@@ -1247,6 +1427,7 @@ class CrazyBridge(Node):
             "_qd_log",
             "_ang_vel_err_log",
             "_ekf_oot_log",
+            "_ekf_bias_log",
             "_ekf_adapt_log",
         ):
             log = getattr(self, name, None)
