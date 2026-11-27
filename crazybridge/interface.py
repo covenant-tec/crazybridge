@@ -96,8 +96,16 @@ class EkfOotDiag:
     PARAM_USE_STOCK = "ekfOot.useStock"
     PARAM_MODE = "ekfOot.mode"
     PARAM_RESET = "ekfOot.reset"
+    PARAM_CALIB_BIAS = "ekfOot.calibBias"
     PARAM_ENABLE_CLAMP = "ekfOot.enableClamp"
     PARAM_RECONN_SKIP = "ekfOot.reconnSkip"
+
+    # Bitmask flags exported in ``ekfOot.flags`` (uint8).
+    FLAG_BIAS_READY = 1 << 0
+    FLAG_POSE_RECENT = 1 << 1
+    FLAG_CHOL_FAIL_SEEN = 1 << 2
+    FLAG_NAN_RESET_SEEN = 1 << 3
+    FLAG_STOCK_ACTIVE = 1 << 4
 
     # Ordered tuple of (crtp_var_name, cflib_type, rerun_entity_path, rgb_color).
     # Total CRTP payload: 4 + 4 + 2 + 2 + 1 + 4 + 4 = 21 bytes (<= 26 B limit).
@@ -109,6 +117,33 @@ class EkfOotDiag:
         ("flags", "uint8_t", "/ekf_oot/flags", [120, 255, 120]),
         ("rtPred", "float", "/ekf_oot/rt_pred", [180, 180, 255]),
         ("rtUpd", "float", "/ekf_oot/rt_upd", [255, 220, 100]),
+    )
+    NUM_FIELDS = len(FIELDS)
+
+
+class EkfBiasDiag:
+    """CRTP and ROS 2 schema for calibrated stationary IMU bias (``ekfBias.*``).
+
+    Total CRTP payload: 6 * 4 = 24 bytes (<= 26 B limit), subscribed in its own
+    dedicated low-rate block (default 2 Hz / 500 ms) in both ``stock`` and ``oot``
+    estimator modes so existing log blocks retain their full rates.
+
+    Units, axes (FLU body frame: +X front, +Y left, +Z up), and sign match
+    ``Topics.IMU``: ``biasAx, biasAy, biasAz`` are in m/s^2 (with +9.81 m/s^2
+    gravity subtracted on +Z) and ``biasGx, biasGy, biasGz`` are in rad/s, so
+    ``imu_a - imu_bias_a`` is ~[0, 0, +9.81] m/s^2 at level rest and
+    ``imu_g - imu_bias_g`` is ~[0, 0, 0] rad/s at rest.
+    """
+
+    LOG_GROUP = "ekfBias"
+
+    FIELDS = (
+        ("biasAx", "float", "/ekf_bias/ax", [255, 110, 110]),
+        ("biasAy", "float", "/ekf_bias/ay", [110, 255, 110]),
+        ("biasAz", "float", "/ekf_bias/az", [110, 160, 255]),
+        ("biasGx", "float", "/ekf_bias/gx", [255, 180, 90]),
+        ("biasGy", "float", "/ekf_bias/gy", [180, 255, 90]),
+        ("biasGz", "float", "/ekf_bias/gz", [180, 130, 255]),
     )
     NUM_FIELDS = len(FIELDS)
 
@@ -141,6 +176,7 @@ class Create:
 
     ODOM = "~/odometry"
     IMU = "~/imu"
+    IMU_BIAS = "~/imu_bias"
     BATTERY = "~/battery"
     BATTERY_VOLTAGE = "~/battery_voltage"
     EKF_DIAG = "~/ekf_diag"
@@ -165,6 +201,7 @@ class Topics:
 
     ODOM = "/crazybridge/odometry"
     IMU = "/crazybridge/imu"
+    IMU_BIAS = "/crazybridge/imu_bias"
     BATTERY = "/crazybridge/battery"
     BATTERY_VOLTAGE = "/crazybridge/battery_voltage"
     EKF_DIAG = "/crazybridge/ekf_diag"
@@ -218,6 +255,7 @@ class BridgePublishers:
         )
         self.orientation_error = node.create_publisher(Quaternion, Create.ORI_ERROR, 1)
         self.imu = node.create_publisher(Imu, Create.IMU, 10)
+        self.imu_bias = node.create_publisher(Float32MultiArray, Create.IMU_BIAS, 10)
         self.ekf_diag = node.create_publisher(Float32MultiArray, Create.EKF_DIAG, 10)
         self.ekf_adapt = node.create_publisher(Float32MultiArray, Create.EKF_ADAPT, 10)
 
