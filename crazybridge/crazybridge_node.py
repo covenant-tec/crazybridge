@@ -29,15 +29,19 @@ from geometry_msgs.msg import (
     Vector3,
 )
 from nav_msgs.msg import Odometry
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Imu
 from std_msgs.msg import Float32, Float32MultiArray, Header
 from std_srvs.srv import SetBool
 
+from crazybridge.adapt_conf import AdaptConf, PARAM_GROUP as EKF_POLICY_GROUP, default_adapt_conf_path
 from crazybridge.interface import (
+    AdaptMode,
     BridgePublishers,
     Create,
+    EkfAdaptDiag,
     EkfOotDiag,
     EstimatorMode,
     TrackingMode,
@@ -76,7 +80,12 @@ class CrazyBridge(Node):
         self.declare_parameter("load_pid_conf", True)
         self.declare_parameter("max_distance_from_origin", 3.0)
         self.declare_parameter("tracking_mode", TrackingMode.RIGID_BODY)
-        self.declare_parameter("estimator_mode", EstimatorMode.AUTO)
+        self.declare_parameter("estimator_mode", EstimatorMode.STOCK)
+        self.declare_parameter("adapt_mode", AdaptMode.STATIC)
+        self.declare_parameter("adapt_conf_path", "")
+        self.declare_parameter("load_adapt_conf", True)
+        self.declare_parameter("ekf_enable_clamp", False)
+        self.declare_parameter("ekf_reconn_skip", False)
         self.declare_parameter("rigid_body_id", "")
         self.declare_parameter("marker_id", "")
 
@@ -142,10 +151,43 @@ class CrazyBridge(Node):
             self._estimator_mode = est_mode_raw
         else:
             self.get_logger().warning(
-                f"Unknown estimator_mode={est_mode_raw!r}; defaulting to {EstimatorMode.AUTO}"
+                f"Unknown estimator_mode={est_mode_raw!r}; defaulting to {EstimatorMode.STOCK}"
             )
-            self._estimator_mode = EstimatorMode.AUTO
+            self._estimator_mode = EstimatorMode.STOCK
         self.get_logger().info(f"Configured estimator mode: {self._estimator_mode}")
+
+        adapt_mode_raw = (
+            self.get_parameter("adapt_mode")
+            .get_parameter_value()
+            .string_value
+        )
+        adapt_norm = AdaptMode.normalize(adapt_mode_raw)
+        if adapt_norm is not None:
+            self._adapt_mode = adapt_norm
+        else:
+            self.get_logger().warning(
+                f"Unknown adapt_mode={adapt_mode_raw!r}; defaulting to {AdaptMode.STATIC}"
+            )
+            self._adapt_mode = AdaptMode.STATIC
+        self.get_logger().info(f"Configured EKF adaptation mode: {self._adapt_mode}")
+
+        adapt_conf_raw = (
+            self.get_parameter("adapt_conf_path")
+            .get_parameter_value()
+            .string_value.strip()
+        )
+        self._adapt_conf_path: str = (
+            adapt_conf_raw if adapt_conf_raw else default_adapt_conf_path()
+        )
+        self._load_adapt_conf = bool(
+            self.get_parameter("load_adapt_conf").get_parameter_value().bool_value
+        )
+        self._ekf_enable_clamp = bool(
+            self.get_parameter("ekf_enable_clamp").get_parameter_value().bool_value
+        )
+        self._ekf_reconn_skip = bool(
+            self.get_parameter("ekf_reconn_skip").get_parameter_value().bool_value
+        )
 
         rigid_id_raw = (
             self.get_parameter("rigid_body_id")
@@ -182,6 +224,7 @@ class CrazyBridge(Node):
         self._oot_q_err = (0.0, 0.0, 0.0, 1.0)  # (x, y, z, w)
         self._oot_qd = (0.0, 0.0, 0.0, 1.0)  # (x, y, z, w)
         self._ekf_oot_log: LogConfig | None = None
+        self._ekf_adapt_log: LogConfig | None = None
 
         self._safe_to_fly: bool = False
         self._bad_mocap_counter: int = 0
@@ -252,6 +295,7 @@ class CrazyBridge(Node):
                 f"({self._connect_error or 'no failure callback fired'})"
             )
             return
+        self.add_on_set_parameters_callback(self._on_parameter_update)
         self._safety_interval = self.create_timer(1, self._safety_check)
 
     def _on_console(self, text):
@@ -345,6 +389,7 @@ class CrazyBridge(Node):
         self._setup_core_logs()
         self._setup_oot_logs()
         self._setup_ekf_oot_logs()
+        self._setup_ekf_adapt_logs()
 
         self._connected.set()
 
@@ -370,8 +415,31 @@ class CrazyBridge(Node):
             return False
         return name in toc_dict.get(group, {})
 
+    def _apply_adapt_conf(self, path: str) -> None:
+        """Load ``adapt_policies.conf`` and push ``ekfPolicy.*`` to the Crazyflie."""
+        if not self._has_param_group(EKF_POLICY_GROUP):
+            self.get_logger().info(
+                f"Firmware TOC has no {EKF_POLICY_GROUP!r} group; skipping policy upload."
+            )
+            return
+        conf = AdaptConf.load(path)
+        self.get_logger().info(f"Loading EKF adaptation policies from {path}")
+        for line in conf.describe():
+            self.get_logger().info(line)
+        for name, value in conf.params():
+            group, var = name.split(".", 1)
+            if self._has_param(group, var):
+                self._cf.param.set_value(name, value)
+        self.get_logger().info("Done configuring EKF adaptation policies")
+
+    def _has_param_group(self, group: str) -> bool:
+        """Return True if ``group`` is present in the connected Crazyflie's param TOC."""
+        toc = getattr(getattr(self._cf, "param", None), "toc", None)
+        toc_dict = getattr(toc, "toc", None)
+        return isinstance(toc_dict, dict) and group in toc_dict
+
     def _configure_estimator(self) -> None:
-        """Enable high-level commander and select stock vs Out-Of-Tree EKF."""
+        """Enable high-level commander and select stock vs Out-Of-Tree EKF + adaptation mode."""
         has_custom_ekf = self._has_log_group(EkfOotDiag.LOG_GROUP)
         has_stock_switch = self._has_param(EkfOotDiag.LOG_GROUP, "useStock")
 
@@ -389,10 +457,47 @@ class CrazyBridge(Node):
                         "[ESTIMATOR] Selected STOCK Bitcraze Kalman filter "
                         f"({EkfOotDiag.PARAM_USE_STOCK}=1)."
                     )
+                    if self._adapt_mode != AdaptMode.STATIC:
+                        self.get_logger().warning(
+                            f"[ESTIMATOR] adapt_mode={self._adapt_mode!r} is inactive while "
+                            "estimator_mode='stock'. Pass estimator_mode:=oot to activate the custom AEKF."
+                        )
                 else:
+                    if self._load_adapt_conf and self._adapt_conf_path:
+                        try:
+                            self._apply_adapt_conf(self._adapt_conf_path)
+                        except Exception as exc:
+                            self.get_logger().error(
+                                f"Failed to load EKF policies from {self._adapt_conf_path}: {exc}"
+                            )
+
+                    if self._has_param(EkfOotDiag.LOG_GROUP, "enableClamp"):
+                        self._cf.param.set_value(
+                            EkfOotDiag.PARAM_ENABLE_CLAMP,
+                            1 if self._ekf_enable_clamp else 0,
+                        )
+                    if self._has_param(EkfOotDiag.LOG_GROUP, "reconnSkip"):
+                        self._cf.param.set_value(
+                            EkfOotDiag.PARAM_RECONN_SKIP,
+                            1 if self._ekf_reconn_skip else 0,
+                        )
+
+                    mode_id = AdaptMode.FIRMWARE_ID[self._adapt_mode]
+                    if self._has_param(EkfOotDiag.LOG_GROUP, "mode"):
+                        self._cf.param.set_value(EkfOotDiag.PARAM_MODE, mode_id)
+                    elif self._adapt_mode != AdaptMode.STATIC:
+                        self.get_logger().warning(
+                            f"[ESTIMATOR] Requested adapt_mode={self._adapt_mode!r}, but "
+                            f"{EkfOotDiag.PARAM_MODE!r} is not in firmware TOC."
+                        )
+
+                    if self._has_param(EkfOotDiag.LOG_GROUP, "reset"):
+                        self._cf.param.set_value(EkfOotDiag.PARAM_RESET, 1)
+
                     self.get_logger().info(
-                        "[ESTIMATOR] Selected Out-Of-Tree 13-state EKF "
-                        f"({EkfOotDiag.PARAM_USE_STOCK}=0)."
+                        "[ESTIMATOR] Selected Out-Of-Tree 13-state AEKF "
+                        f"(useStock=0, adapt_mode={self._adapt_mode!r} [id={mode_id}], "
+                        f"clamp={self._ekf_enable_clamp}, reconn_skip={self._ekf_reconn_skip})."
                     )
             else:
                 self._cf.param.set_value(PARAM_ESTIMATOR, ESTIMATOR_KALMAN)
@@ -407,6 +512,71 @@ class CrazyBridge(Node):
                     )
         except Exception as exc:
             self.get_logger().error(f"Failed to set startup estimator params: {exc}")
+
+    def _on_parameter_update(self, params) -> SetParametersResult:
+        """Allow live switching of estimator_mode / adapt_mode via ``ros2 param set``."""
+        new_est = self._estimator_mode
+        new_adapt = self._adapt_mode
+        new_clamp = self._ekf_enable_clamp
+        new_skip = self._ekf_reconn_skip
+        new_conf_path = self._adapt_conf_path
+        reconfigure = False
+
+        for p in params:
+            if p.name == "estimator_mode":
+                cand = str(p.value).strip().lower()
+                if cand not in (EstimatorMode.AUTO, EstimatorMode.OOT, EstimatorMode.STOCK):
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f"Invalid estimator_mode={p.value!r}; use stock|oot|auto",
+                    )
+                new_est = cand
+                reconfigure = True
+            elif p.name == "adapt_mode":
+                cand = AdaptMode.normalize(str(p.value))
+                if cand is None:
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f"Invalid adapt_mode={p.value!r}; use static|mdp|smdp",
+                    )
+                new_adapt = cand
+                reconfigure = True
+            elif p.name == "ekf_enable_clamp":
+                new_clamp = bool(p.value)
+                reconfigure = True
+            elif p.name == "ekf_reconn_skip":
+                new_skip = bool(p.value)
+                reconfigure = True
+            elif p.name == "adapt_conf_path":
+                raw = str(p.value).strip()
+                cand_path = raw if raw else default_adapt_conf_path()
+                if not os.path.isfile(cand_path):
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f"adapt_conf_path not found: {cand_path}",
+                    )
+                new_conf_path = cand_path
+                reconfigure = True
+
+        self._estimator_mode = new_est
+        self._adapt_mode = new_adapt
+        self._ekf_enable_clamp = new_clamp
+        self._ekf_reconn_skip = new_skip
+        self._adapt_conf_path = new_conf_path
+
+        if reconfigure and self._cf.is_connected():
+            self._configure_estimator()
+            if self._estimator_mode == EstimatorMode.STOCK:
+                if self._ekf_adapt_log is not None:
+                    try:
+                        self._ekf_adapt_log.stop()
+                    except Exception:
+                        pass
+                    self._ekf_adapt_log = None
+            elif self._ekf_adapt_log is None:
+                self._setup_ekf_adapt_logs()
+
+        return SetParametersResult(successful=True)
 
     def _setup_core_logs(self) -> None:
         """Register estimator-agnostic state, IMU, battery, and setpoint CRTP logs."""
@@ -498,6 +668,34 @@ class CrazyBridge(Node):
             self._ekf_oot_log = None
             self.get_logger().warning(
                 f"Failed to register optional {EkfOotDiag.LOG_GROUP!r} log block: {exc}"
+            )
+
+    def _setup_ekf_adapt_logs(self) -> None:
+        """Optionally subscribe to Adaptive EKF decision telemetry (``ekfAdapt.*``)."""
+        if self._estimator_mode == EstimatorMode.STOCK:
+            self._ekf_adapt_log = None
+            return
+        if not self._has_log_group(EkfAdaptDiag.LOG_GROUP):
+            self._ekf_adapt_log = None
+            return
+
+        adapt_log = LogConfig(name="ekf_adapt", period_in_ms=self._ekf_log_period_ms)
+        for var_name, var_type, _, _ in EkfAdaptDiag.FIELDS:
+            adapt_log.add_variable(f"{EkfAdaptDiag.LOG_GROUP}.{var_name}", var_type)
+
+        try:
+            self._cf.log.add_config(adapt_log)
+            adapt_log.data_received_cb.add_callback(self._on_ekf_adapt_log)
+            adapt_log.start()
+            self._ekf_adapt_log = adapt_log
+            self.get_logger().info(
+                f"Adaptive EKF telemetry block ({EkfAdaptDiag.LOG_GROUP!r}) started "
+                f"at {self._ekf_log_period_ms} ms"
+            )
+        except Exception as exc:
+            self._ekf_adapt_log = None
+            self.get_logger().warning(
+                f"Failed to register optional {EkfAdaptDiag.LOG_GROUP!r} log block: {exc}"
             )
 
     def _setup_oot_logs(self) -> None:
@@ -807,6 +1005,14 @@ class CrazyBridge(Node):
         ]
         self._pubs.ekf_diag.publish(msg)
 
+    def _on_ekf_adapt_log(self, _timestamp, data, _logconf) -> None:
+        msg = Float32MultiArray()
+        msg.data = [
+            float(data[f"{EkfAdaptDiag.LOG_GROUP}.{var_name}"])
+            for var_name, _, _, _ in EkfAdaptDiag.FIELDS
+        ]
+        self._pubs.ekf_adapt.publish(msg)
+
     def _on_pos_err_log(self, _timestamp, data, _logconf) -> None:
         v = (
             float(data["oot.pos_err_x"]),
@@ -1041,6 +1247,7 @@ class CrazyBridge(Node):
             "_qd_log",
             "_ang_vel_err_log",
             "_ekf_oot_log",
+            "_ekf_adapt_log",
         ):
             log = getattr(self, name, None)
             if log is None:
